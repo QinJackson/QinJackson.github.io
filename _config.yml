@@ -119,7 +119,21 @@ actions:
 
 comments:
   # Global switch for the post-comment system. Keeping it empty means disabled.
-  provider: giscus # [disqus | utterances | giscus]
+  provider: giscus # [disqus | utterances | giscus | twikoo]
+  # ---- Twikoo (self-hosted comments): prepared, currently INACTIVE ----
+  # To switch over:
+  #   1) deploy the Twikoo cloud function (backend) somewhere - Vercel / Netlify /
+  #      Tencent CloudBase / Docker - and keep its version equal to the one below;
+  #   2) paste its address into env_id;
+  #   3) set provider: twikoo;
+  #   4) allow this site in that backend CORS setting (CORS_ALLOW_ORIGIN),
+  #      otherwise the browser will block the requests.
+  # The frontend js is already self-hosted (assets/vendor/twikoo/twikoo.min.js),
+  # so there is no runtime dependency on a third-party CDN.
+  twikoo:
+    env_id: # e.g. https://twikoo-xxxx.vercel.app   (Tencent CloudBase: the env id)
+    version: 2.0.12 # must match the deployed cloud function version
+    region: # Tencent CloudBase only, e.g. ap-shanghai
   # The provider options are as follows:
   disqus:
     shortname: # fill with the Disqus shortname. › https://help.disqus.com/en/articles/1717111-what-s-a-shortname

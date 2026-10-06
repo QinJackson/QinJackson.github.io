@@ -1,0 +1,43 @@
+{%- comment -%}
+  Twikoo comments (self-hosted frontend).
+  Activated by setting `comments.provider: twikoo` in _config.yml.
+
+  Prerequisites (see _config.yml -> comments.twikoo):
+    1. a deployed Twikoo cloud function (Vercel / Netlify / CloudBase / Docker),
+       with the SAME version as the frontend js below;
+    2. its address pasted into `comments.twikoo.env_id`;
+    3. this site allowed in that backend's CORS setting (CORS_ALLOW_ORIGIN).
+
+  The frontend js is served from this site (assets/vendor/twikoo/) on purpose,
+  so there is no runtime dependency on a third-party CDN.
+{%- endcomment -%}
+
+{%- if site.comments.twikoo.env_id -%}
+<script src="{{ '/assets/vendor/twikoo/twikoo.min.js' | relative_url }}"></script>
+<script>
+  (function () {
+    var box = document.createElement('div');
+    box.id = 'twikoo';
+    var footer = document.querySelector('footer');
+    if (footer) {
+      footer.insertAdjacentElement('beforebegin', box);
+    } else {
+      document.body.appendChild(box);
+    }
+    if (typeof twikoo === 'undefined') {
+      console.error('twikoo: frontend js was not loaded');
+      return;
+    }
+    twikoo.init({
+      envId: '{{ site.comments.twikoo.env_id }}',
+      el: '#twikoo',
+      lang: '{{ site.lang | default: "zh-CN" }}'
+      {%- if site.comments.twikoo.region -%}
+      , region: '{{ site.comments.twikoo.region }}'
+      {%- endif -%}
+    });
+  })();
+</script>
+{%- else -%}
+<!-- twikoo: comments.twikoo.env_id is empty, nothing rendered -->
+{%- endif -%}
