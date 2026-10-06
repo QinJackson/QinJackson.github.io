@@ -9,6 +9,11 @@ on:
       - README.md
       - LICENSE
 
+  # Refresh the GitHub avatar (and rebuild the site) once a week,
+  # so the sidebar avatar follows your GitHub profile automatically.
+  schedule:
+    - cron: "0 3 * * 0"
+
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
@@ -34,6 +39,21 @@ jobs:
           # submodules: true
           # If using the 'assets' git submodule from Chirpy Starter, uncomment above
           # (See: https://github.com/cotes2020/chirpy-starter/tree/main/assets)
+
+      - name: Sync GitHub avatar
+        # Pull the current avatar of the repo owner into the site build.
+        # Local (same-origin) file => no external CDN dependency at runtime.
+        run: |
+          mkdir -p assets/avatar
+          if curl -fsSL --retry 3 --retry-delay 2 \
+               -o /tmp/gh-avatar.png \
+               "https://github.com/${GITHUB_REPOSITORY_OWNER}.png?size=460"; then
+            mv /tmp/gh-avatar.png assets/avatar/avatar.png
+            file assets/avatar/avatar.png
+            ls -l assets/avatar/avatar.png
+          else
+            echo "avatar sync failed - keeping the copy committed in the repository"
+          fi
 
       - name: Setup Pages
         id: pages
