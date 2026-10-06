@@ -1,6 +1,6 @@
 ---
 title: 博客上线了
-date: 2026-10-06 22:45:00 +0800
+date: 2026-10-06 20:00:00 +0800
 categories: [随笔]
 tags: [Jekyll, Chirpy, GitHub Pages]
 ---
