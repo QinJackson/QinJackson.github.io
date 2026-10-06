@@ -87,10 +87,12 @@ jobs:
           du -sh "$SITE/assets/lib"
 
       - name: Test site
+        # The 29 image placeholders in the long-form post (图片占位-*.png) are intentional
+        # author TODOs, so their 404s are excluded from the link check.
         run: |
           bundle exec htmlproofer _site \
             \-\-disable-external \
-            \-\-ignore-urls "/^http:\/\/127.0.0.1/,/^http:\/\/0.0.0.0/,/^http:\/\/localhost/"
+            \-\-ignore-urls "/^http:\/\/127.0.0.1/,/^http:\/\/0.0.0.0/,/^http:\/\/localhost/,/^.*%E5%9B%BE%E7%89%87%E5%8D%A0%E4%BD%8D.*$/,/^.*\u56fe\u7247\u5360\u4f4d.*$/"
 
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v5

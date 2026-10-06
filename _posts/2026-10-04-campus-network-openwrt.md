@@ -1,0 +1,2386 @@
+---
+title: 校园网折腾全记录：防检测、自动登录、设备管控与流量监测（OpenWrt 实战）
+date: 2026-10-04 17:30:00 +0800
+categories: [路由器]
+tags:
+  - 校园网防检测
+  - 自动登录
+  - OpenWrt
+  - ImmortalWrt
+  - Dr.COM
+  - 路由器
+  - 宿舍网络
+  - 流量监控
+  - 桂林理工大学
+description: 用一台 360T7 软路由统一 UA/TTL/IPID 绕过校园网"一号两设备"检测，配套自动登录脚本解决掉线重认证与夜间断网，外加白名单设备管控与境外流量/不良网站监测的完整实战记录（含 15 个踩坑）
+image: /assets/img/posts/campus-network-cover.png
+toc: true
+comments: true
+---
+
+> 作者：QinJackson　｜　首发于 qinjackson.github.io　｜　转载请注明出处
+
+
+> 大一时还能随便接个路由器就共享上网，大二一开学，GUT 就上了一号两设备的限制 —— 于是就有了这一整套折腾。
+>
+> 为什么折腾校园网？一是想要一个稳定的上网环境（写代码、查资料、挂网课，掉线一次就够烦的）；二是想省一点网费（一个宿舍一条线，比人手一个账号划算多了）；三是我始终觉得「手机开热点给电脑连」是一种很妥协的做法 —— 费电、发热、还限速。
+>
+> 折腾了大半个月，从「只会照着教程复制粘贴」到「能自己抓包看协议、自己写脚本」，中间踩了 15 个坑（真的数过）。这篇把整个过程完整写下来，既是给自己留个存档，也希望后来的人少走点弯路。
+
+![宿舍路由器全貌（360T7 放在桌上）](图片占位-路由器全貌.png)
+<!-- 建议截图：你的路由器实物照（含网线 / 电源 / 摆放位置），不用拍很清晰，能看出是什么设备就行 -->
+
+**先给一句结论**：整套方案的核心只有一句话 —— **在宿舍路由器这一层，把所有设备的"身份特征"统一成同一个，让学校网关以为只有一台设备在上网。**
+
+围绕这句话，一共做四件事：
+
+| 层次 | 做什么 | 必要性 |
+|---|---|---|
+| ① UA 统一 | 用 UAmask 把所有设备的 User-Agent 改成同一个真实浏览器 UA | **必做**（学校真正在查的就是这个） |
+| ② L3 特征统一 | iptables 统一 TTL / IPID，NTP 强制走路由器 | 保险（学校目前不查，但成本极低） |
+| ③ 自动登录 | 掉线后自动重新认证，最多 2 分钟恢复 | **强烈建议**（兜底，救命的） |
+| ④ 设备管控 + 监测 | 陌生设备限制 + 境外流量/不良网站记录 | 可选，但宿舍共享强烈建议 |
+
+---
+
+## 阅读指引
+
+| 章节 | 内容 | 难度 | 适合谁 |
+|---|---|---|---|
+| 第 1 章 | 原理：学校怎么检测、我们怎么防 | ★ | 所有人（先看这个） |
+| 第 2 章 | 准备清单（硬件 / 固件 / 工具） | ★ | 还没买设备的 |
+| 第 3 章 | 第一步：装 UA 改写插件（核心） | ★★ | **所有人都要做** |
+| 第 4 章 | 第二步：统一 TTL / IPID / NTP（进阶保险） | ★★★ | 想防"以后升级"的 |
+| 第 5 章 | 第三步：自动登录脚本（被踢自动重登） | ★★★ | **所有人都建议做** |
+| 第 6 章 | 验证清单：怎么确认全都生效了 | ★★ | 装完检查的 |
+| 第 7 章 | 踩坑大全（15 个坑，血泪总结） | ★★ | 出问题的时候查 |
+| 第 8 章 | 日常维护与换运营商 | ★ | 用起来之后的 |
+| 第 9 章 | 陌生设备管控 + 流量监测（可选进阶） | ★★★ | 宿舍多人共享的 |
+| 附录 | 实测环境 / 参数表 / 参考链接 | — | 按需查阅 |
+
+> 如果你是纯小白，建议**按顺序读**；赶时间可以直接跳到第 3 章 + 第 5 章（这两章是真正解决问题的）。第 9 章内容很多，不急的话可以先跳过，等前面跑稳了再回来。
+
+---
+
+## 第 1 章　原理：学校怎么检测，我们怎么防
+
+> **本章解决什么问题**：搞清楚学校到底靠什么判断"一个账号后面挂了几台设备"，你才知道该防哪里、哪些可以不用管。
+
+### 1.1 为什么会被踢下线
+
+学校为了限制"一个账号多人共用"，会在网关侧分析你的上网流量特征。常见检测手段按**防范难度**排序：
+
+| 检测手段 | 原理 | 特征 | 防范难度 |
+|---|---|---|---|
+| ① UA 检测 | HTTP 请求头里的 User-Agent 会暴露设备和浏览器 | 同一 IP 出现 Windows + Android + iPhone 三种 UA | ★ 最容易防 |
+| ② TTL 检测 | 不同系统的默认 TTL 不同（Windows=128，Linux/安卓=64） | 同一 IP 的 TTL 忽 128 忽 64 | ★★ |
+| ③ TCP 时间戳 | 用 TCP 时间戳推算设备时钟偏移 | 同一 IP 出现多个时钟基准 | ★★★ |
+| ④ DPI 深度包检测 | 识别具体应用特征（如微信） | 流量指纹不符单设备特征 | ★★★★ 最难防 |
+
+![校园网认证页面（Dr.COM 门户）](图片占位-认证门户页面.png)
+<!-- 建议截图：浏览器打开认证页面的样子（把学号、密码打码或直接涂掉），用于说明"一号两设备"提示出现在哪里 -->
+
+> **【重要实测结论】** 经实测确认：桂林理工大学(GUT) 目前**只有 UA 检测**。
+>
+> 所以第 3 章是**必做项**，第 4 章属于"万一以后学校升级"的保险 —— 做了也不亏（成本几乎是零）。
+
+### 1.2 防护思路
+
+核心思想就一句话：
+
+> **在宿舍路由器这一层，把所有设备的"身份特征"统一成同一个，让学校网关以为只有一台设备在上网。**
+
+具体拆成三条：
+
+1. **统一 UA**：把所有设备的 UA 都改成同一个 —— 推荐填一个**真实的浏览器 UA**，而不是 `FFF` 这种一看就是伪造的值（原因见附录 E）
+2. **统一 TTL**：把所有出站包的 TTL 固定成同一个值（如 64）
+3. **统一其他特征**：统一 IPID、把 NTP 时间同步强制指向路由器
+
+![整体架构图](图片占位-整体架构图.png)
+<!-- 建议截图 / 画图：校园网 ← WAN ← 路由器（UAmask + TTL/IPID + 自动登录） ← LAN ← 你的电脑 / 手机 / 其他设备。手绘拍照也行 -->
+
+---
+
+## 第 2 章　准备清单
+
+> **本章解决什么问题**：动手之前先把东西备齐、把前提确认掉，避免做到一半发现固件不对、工具没有。
+
+| 项目 | 要求 | 说明 |
+|---|---|---|
+| 路由器 | 能刷 OpenWrt / ImmortalWrt | 本文以 **360T7**（MT7981，256MB 内存起步）为例 |
+| 固件 | ImmortalWrt 24.10 或 OpenWrt 23.05+ | 注意：24.10 使用 **fw4(nftables)** 防火墙 |
+| 电脑 | Windows | 用于操作路由器、抓包 |
+| SSH 工具 | FinalShell / PuTTY / Windows 自带 `ssh` | 后面很多操作用命令行更方便 |
+| 网线 | Cat5e / Cat6（8 芯全通） | 墙口 → 路由器这一段，劣质线会掉到百兆 |
+| 网络 | 路由器已能上网 | **先手动认证一次，确认能上网再动手** |
+
+![准备清单实物（路由器 + 网线 + 电源）](图片占位-准备清单.png)
+<!-- 建议截图：路由器、网线、电源适配器摆在一起的照片 -->
+
+> **【提示】** 先做一件事：用网线或 WiFi 连上路由器，浏览器打开 `192.168.6.1`（360T7 刷 ImmortalWrt 后的默认地址），用 root 密码登录 LuCI 后台。后面的操作都在这里进行。
+
+![LuCI 登录界面](图片占位-LuCI登录界面.png)
+<!-- 建议截图：LuCI 登录页（或登录后的首页概览），能看出是 ImmortalWrt 主题即可 -->
+
+---
+
+## 第 3 章　第一步：装 UA 改写插件（核心必做）
+
+> **本章解决什么问题**：让学校那边看到的 User-Agent 永远是同一个（一台 Windows 电脑），无论你实际连了几台手机、几台电脑。
+>
+> 这是整套方案里**唯一必做**的一步 —— 因为学校目前查的就是 UA。
+
+### 3.1 选哪个插件
+
+| 插件 | 特点 | 推荐度 |
+|---|---|---|
+| **UAmask** | 防火墙转发模式，性能好、内存占用低、开箱即用 | ★ **首选（本文使用）** |
+| UA3F | 功能更全（可改 TTL/IPID/抗 DPI），但资源占用高，实测被踢概率更高 | 备用 |
+
+> **【注意】** 两个插件**只能启用一个**！同时开启会互相打架导致失效。
+
+![UAmask 与 UA3F 的对比（GitHub 项目页）](图片占位-两个插件对比.png)
+<!-- 建议截图：UAmask 项目 GitHub 首页（或 release 页面），说明从哪里下载 -->
+
+### 3.2 查路由器架构（决定下载哪个安装包）
+
+SSH 连上路由器后执行：
+
+```bash
+uname -m                     # 例如输出 aarch64
+opkg print-architecture      # 更精确，例如 aarch64_cortex-a53
+```
+
+| 架构 | 该下载的安装包 |
+|---|---|
+| `aarch64_cortex-a53`（如 360T7、R2S） | `UAmask_x.x.x-1_aarch64_cortex-a53.ipk` |
+| `mipsel_24kc`（如 红米 AC2100） | `UAmask_x.x.x-1_mipsel_24kc.ipk` |
+| `x86_64`（软路由） | `UAmask_x.x.x-1_x86_64.ipk` |
+
+![opkg print-architecture 输出](图片占位-查架构输出.png)
+<!-- 建议截图：SSH 里执行 uname -m 和 opkg print-architecture 的输出结果 -->
+
+> **【注意】** 一定要选 `.ipk`（opkg 系统）。只有新版 snapshot 系统才用 `.apk`，装错会失败。
+
+### 3.3 下载安装包
+
+官方下载地址（GitHub）：
+
+```text
+https://github.com/Zesuy/UA-Mask/releases
+```
+
+如果 GitHub 打不开（校园网常见），在网址前面加镜像前缀：
+
+```text
+https://gh-proxy.com/https://github.com/Zesuy/UA-Mask/releases/download/v0.4.3/UAmask_0.4.3-1_aarch64_cortex-a53.ipk
+```
+
+> **【重要】** 版本必须 **≥ 0.4.3**！
+>
+> v0.4.x 早期版本有个严重 bug：**每 5 分钟断开一次连接**（SSH、网页、游戏都会断），0.4.3 才修复。
+
+### 3.4 安装与启用
+
+1. **安装**：LuCI → 系统 → 软件包 → 上传软件包 → 选择 ipk → 安装
+2. **启用**：LuCI → 服务 → UAmask → 勾选【启用】
+3. **配置**：模式选【**关键词模式**】，关键词填：`Windows,Linux,Android,iPhone,Macintosh,iPad,OpenHarmony`
+4. **保存**：点击【**保存并应用**】
+
+![UAmask 配置界面](图片占位-UAmask配置界面.png)
+<!-- 建议截图：LuCI → 服务 → UAmask 的配置页面（把 UA 那一栏的内容也拍进去），这是全文最重要的一张图 -->
+
+![安装 ipk 的界面](图片占位-上传ipk安装.png)
+<!-- 建议截图：LuCI → 系统 → 软件包 → 上传软件包 的界面 -->
+
+关于"**流量卸载 / 非 HTTP 旁路**"选项：
+
+- **开启**：性能更好（非 HTTP 流量不经过插件），但极少数 HTTP 流量可能漏改 UA
+- **关闭**：UA 改得最彻底，但 CPU 占用略高（MT7981 完全带得动）
+
+两种选择都可以：开启（性能更好，非 HTTP 流量不经过插件）／ 关闭（官方提示：UA 泄露风险最低，但 CPU 占用略高）。本文对应的实测路由器使用的是【**开启**】状态，若日后频繁被踢下线，可以先试着关掉它再观察。
+
+### 3.5 验证 UA 是否改成功
+
+在电脑浏览器或命令行访问这个【**HTTP**】（不是 HTTPS）地址：
+
+```text
+http://httpbin.org/user-agent
+```
+
+如果返回：
+
+```json
+{
+  "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+}
+```
+
+**恭喜，UA 改写生效了。** 如果返回的还是你自己的浏览器 UA，说明插件没生效，回去检查是否启用了、是否只启用了一个插件。
+
+![UA 验证成功的结果](图片占位-UA验证结果.png)
+<!-- 建议截图：浏览器访问 http://httpbin.org/user-agent 的返回结果，能看到统一的 Chrome/147 UA -->
+
+> **💡 小技巧**：拿手机也访问一次这个地址，如果手机返回的 UA 和电脑**完全一样**，才说明真的生效了（因为手机的 UA 里带 Android/iPhone 关键字，是最容易被识别的）。
+
+---
+
+## 第 4 章　第二步：统一 TTL / IPID / NTP（进阶保险）
+
+> **本章解决什么问题**：把"逐包"层面的设备特征也统一掉 —— 即使学校哪天升级成 TTL 检测，你这套也照样过。
+>
+> ⚠️ 本章有个**必须踩过才知道的坑**（4.6 节：硬件加速会绕过这些规则），上一版教程里就栽在这上面。
+
+> **【提示】** GUT 目前不做 TTL 检测，所以这一步**可以跳过**。但如果你想把防护做满（或以后学校升级检测），建议做，成本几乎是零。
+
+### 4.1 原理
+
+| 规则 | 作用 |
+|---|---|
+| **TTL=64** | 把所有出站包的 TTL 统一成 64，避免 Windows(128)/手机(64) 混用被识别 |
+| **IPID 标记** | 统一 IP 包 ID 的分配规律，防 IPID 指纹检测 |
+| **NTP 强制本地** | 把所有设备的时间同步请求劫持到路由器，避免时钟偏移被检测 |
+
+### 4.2 创建规则脚本
+
+SSH 登录路由器，执行 `nano /etc/l3_anti_detect.sh`，粘贴以下内容（注意把 `LAN_IP` / `LAN_NET` 改成你自己的）：
+
+```bash
+#!/bin/sh
+# 校园网防检测 - L3 层(TTL / IPID / NTP)
+# 可重复执行,由 /etc/rc.local 开机调用
+
+IPT=iptables
+LAN_IP=192.168.6.1          # ← 改成你的路由器 LAN IP
+LAN_NET=192.168.6.0/24      # ← 改成你的 LAN 网段
+TTL_VALUE=64
+
+# --- 清理旧规则(保证可重复执行) ---
+while $IPT -t mangle -D FORWARD -j IPID_MOD 2>/dev/null; do :; done
+while $IPT -t mangle -D OUTPUT -j IPID_MOD 2>/dev/null; do :; done
+$IPT -t mangle -F IPID_MOD 2>/dev/null
+$IPT -t mangle -X IPID_MOD 2>/dev/null
+while $IPT -t nat -D PREROUTING -p udp --dport 123 -j ntp_force_local 2>/dev/null; do :; done
+$IPT -t nat -F ntp_force_local 2>/dev/null
+$IPT -t nat -X ntp_force_local 2>/dev/null
+while $IPT -t mangle -D POSTROUTING -j TTL --ttl-set $TTL_VALUE 2>/dev/null; do :; done
+
+# --- 防 IPID 检测 ---
+$IPT -t mangle -N IPID_MOD
+$IPT -t mangle -A FORWARD -j IPID_MOD
+$IPT -t mangle -A OUTPUT -j IPID_MOD
+$IPT -t mangle -A IPID_MOD -d 0.0.0.0/8 -j RETURN
+$IPT -t mangle -A IPID_MOD -d 127.0.0.0/8 -j RETURN
+# 校园网是 10.x 或 172.16/12 网段时,把对应那行注释掉(让内网流量也统一)
+# $IPT -t mangle -A IPID_MOD -d 10.0.0.0/8 -j RETURN
+# $IPT -t mangle -A IPID_MOD -d 172.16.0.0/12 -j RETURN
+$IPT -t mangle -A IPID_MOD -d 192.168.0.0/16 -j RETURN
+$IPT -t mangle -A IPID_MOD -d 255.0.0.0/8 -j RETURN
+$IPT -t mangle -A IPID_MOD -j MARK --set-xmark 0x10/0x10
+
+# --- 防时钟偏移:NTP 强制走路由器 ---
+$IPT -t nat -N ntp_force_local
+$IPT -t nat -I PREROUTING -p udp --dport 123 -j ntp_force_local
+$IPT -t nat -A ntp_force_local -d 0.0.0.0/8 -j RETURN
+$IPT -t nat -A ntp_force_local -d 127.0.0.0/8 -j RETURN
+$IPT -t nat -A ntp_force_local -d $LAN_NET -j RETURN
+$IPT -t nat -A ntp_force_local -s $LAN_NET -j DNAT --to-destination $LAN_IP
+
+# --- 统一 TTL ---
+$IPT -t mangle -A POSTROUTING -j TTL --ttl-set $TTL_VALUE
+exit 0
+```
+
+保存后赋予执行权限：
+
+```bash
+chmod +x /etc/l3_anti_detect.sh
+/etc/l3_anti_detect.sh      # 立即执行一次
+```
+
+![粘贴规则脚本到 nano](图片占位-nano编辑规则.png)
+<!-- 建议截图：SSH 里 nano 编辑 /etc/l3_anti_detect.sh 的画面，说明改哪两行 -->
+
+### 4.3 让规则开机自动生效
+
+编辑 `/etc/rc.local`，内容改成：
+
+```bash
+#!/bin/sh
+# 校园网防检测:开机应用 L3 层规则
+/etc/l3_anti_detect.sh
+exit 0
+```
+
+然后 `chmod +x /etc/rc.local`。
+
+### 4.4 还需要开 NTP 服务器
+
+LuCI → 系统 → 系统 → **时间同步**，勾选【**作为 NTP 服务器提供服务**】，绑定接口选 `lan`，保存并应用。
+
+> **【注意】** 如果不做这一步，NTP 劫持会把设备的时间同步请求指到一个**不提供授时**的路由器上，反而可能出问题。
+
+![开启 NTP 服务器](图片占位-开启NTP服务器.png)
+<!-- 建议截图：LuCI → 系统 → 系统 → 时间同步 页面，"作为 NTP 服务器提供服务"被打勾 -->
+
+### 4.5 验证（看计数器）
+
+```bash
+iptables -t mangle -L IPID_MOD -n -v          # 看 pkts 是否在增长
+iptables -t mangle -L POSTROUTING -n -v | grep TTL
+iptables -t nat -L ntp_force_local -n -v
+```
+
+`pkts` 数字在涨 = 规则命中生效；**一直是 0 = 没匹配到流量，需要检查**。
+
+![iptables 计数器](图片占位-iptables计数器.png)
+<!-- 建议截图：上面三条命令的输出，能看到 pkts 列的数字（通常几十万到几百万） -->
+
+### 4.6 ⚠️ 硬件加速会绕过 L3 规则（必须关掉）
+
+> **这是本项目踩过最隐蔽的一个坑。**
+
+MTK 平台（360T7 / MT7981 这类）默认开着**硬件加速（HNAT / PPE）**，被它接管的流量会**完全绕过 netfilter** —— 也就是说，本章的 TTL / IPID / NTP 改写对它们**全部失效**，只有每个流的**第一个包**是生效的。
+
+#### 为什么常规检查发现不了
+
+下面这些"看起来正常"的检查，其实**一个都查不出**硬件加速在跑：
+
+```bash
+grep -c OFFLOAD /proc/net/nf_conntrack     # = 0   ← 这只是【软件】卸载的标记
+nft list ruleset | grep -c flowtable        # = 0   ← 同样只是软件 flowtable
+# 但 MTK 的 PPE 是【硬件】接管，上面两个标记根本看不见 ⚠️
+```
+
+真正能看见的地方：
+
+```bash
+cat /sys/kernel/debug/hnat/hook_toggle     # enabled / disabled
+grep BIND /sys/kernel/debug/hnat/hnat_stats # BIND_PPE0=11 表示 11 条流被硬件接管
+cat /sys/kernel/debug/hnat/hnat_entry       # 被接管的具体流（能看到是哪个内网设备）
+```
+
+实测：关之前 `BIND_PPE0 = 11~22`，而且绑定表里明确列着内网设备的流 —— 说明 TTL 改写**确实被跳过了** ⚠️
+
+![hnat_stats 显示 BIND_PPE0 不为 0](图片占位-HNAT绑定表.png)
+<!-- 建议截图：cat /sys/kernel/debug/hnat/hnat_stats 的输出，重点圈出 BIND_PPE0=11 那行；再配一张 hnat_entry 里能看到内网设备 IP 的截图 -->
+
+#### 怎么关（一条命令 + 持久化）
+
+```bash
+echo 0 > /sys/kernel/debug/hnat/hook_toggle      # 立即关闭
+cat /sys/kernel/debug/hnat/hook_toggle            # 确认变成 disabled
+grep BIND /sys/kernel/debug/hnat/hnat_stats       # 应变成 BIND_PPE0=0
+
+# 持久化：写进 /etc/rc.local（开机自动关）
+echo 0 > /sys/kernel/debug/hnat/hook_toggle 2>/dev/null   # 关闭MTK硬件加速,保证TTL/IPID覆盖全部流量
+```
+
+**⚠️ 坑中坑：这个开关只认数字 0 / 1**
+
+```bash
+echo 0 >  /sys/kernel/debug/hnat/hook_toggle   # ✅ 有效（写 0 = 关闭）
+echo 1 >  /sys/kernel/debug/hnat/hook_toggle   # ✅ 有效（写 1 = 开启）
+echo disabled > ...hook_toggle                 # ❌ 被忽略！文件内容不会变
+echo enabled  > ...hook_toggle                 # ❌ 同样无效
+# 教训：往 sysfs / debugfs 写值时，值的形式必须实测确认，不能想当然
+```
+
+#### 为什么 UA 伪装不受影响
+
+这一点很关键 —— 很多人会以为"开了加速什么都失效了"，其实不是：
+
+```text
+UAmask 是在【第一个包】上工作的（prerouting 阶段重定向到本地 12032 端口）
+硬件加速只能接管【已经建立好】的流
+→ 第一个包永远要过 netfilter → UA 改写照常生效 ✅
+
+实测证据：硬件加速开着的那段时间，
+          UAmask 统计 successful_modifications = 3700+ 次
+→ 开着硬件加速，UA 改写依然工作 ✅
+```
+
+同样不受影响的还有：**端口封锁、DNS 劫持、白名单**（都是"首包决策"）。只有【**逐包改写类**】的规则（TTL / IPID / NTP）会被绕过。
+
+#### 那到底要不要关？—— 实测数据
+
+做了交替 A/B 测试（关→开→关→开→关→开，各 3 轮，16 并发，同一镜像，排除时段干扰）：
+
+| 配置 | 第 1 轮 | 第 2 轮 | 第 3 轮 | 平均 |
+|---|---|---|---|---|
+| 硬件加速 关 | 324.3 Mbps | 330.0 Mbps | 422.9 Mbps | **359.1 Mbps** |
+| 硬件加速 开 | 338.0 Mbps | 421.4 Mbps | 432.4 Mbps | **397.3 Mbps** |
+
+差距只有 **11%**，而单轮之间的波动就有 **±15%** —— 也就是说【**几乎没有实质差别**】。
+
+> ⚠️ 但要诚实说明：这次是在"校园网只给约 400 Mbps"的时段测的，两边都被校园网卡住了；如果校园网能给到 700~800 Mbps，CPU 才可能成为瓶颈，那种时段才测得出真差别。
+
+**结论：关掉它几乎不掉速，却换回完整的指纹统一 → 建议直接关掉 ✅**
+
+![A/B 测速测试结果](图片占位-AB测速结果.png)
+<!-- 建议截图：终端里交替测速的输出（两组各三行 Mbps），或者把数据做成一张柱状图 -->
+
+#### 三个教训（值得单独记下来）
+
+- **体检要看【硬件】状态，不能只看软件标记** —— 软件 `OFFLOAD=0` 不等于"没在绕过"
+- **不要拿【不同时间点】的两个数做对比**：本项目一开始就是拿"某时刻关着 230 Mbps"和"另一时刻开着 400 Mbps"比，得出"能提速 2 倍"的**错误结论**；交替测试才看到真相是 11%
+- **往 sysfs / debugfs 写值，值的形式要实测**（这个开关认 0/1，不认 disabled/enabled）
+
+#### 加进看门狗（推荐）
+
+在防检测看门狗里加一条：发现硬件加速被重新打开就自动关掉。
+
+```bash
+chk_hnat() { [ "$(cat /sys/kernel/debug/hnat/hook_toggle 2>/dev/null)" != "enabled" ]; }
+
+if ! chk_hnat; then
+    log "检测到硬件加速(HNAT)被开启，正在关闭(否则TTL/IPID会被绕过)"
+    echo 0 > /sys/kernel/debug/hnat/hook_toggle 2>/dev/null
+    FIXED="yes"
+fi
+```
+
+实测（手动 `echo 1` 打开 → 跑看门狗）：**4 秒内自动关回 disabled** 并写日志 ✅
+
+#### 顺带：监控的流量数字也会受影响
+
+硬件加速开启时，被接管的流**不计入 conntrack 字节统计** → 监测里的"境外流量 xx MB"会**严重偏小** ⚠️
+（不过"连了哪些境外 IP / 哪些不良网站"靠的是**首包打标记**，仍然准确 ✅）
+
+这也是建议关掉硬件加速的第二个理由。
+
+---
+
+## 第 5 章　第三步：自动登录脚本（被踢自动重登）
+
+> **本章解决什么问题**：校园网认证会过期（有时候"无感知认证"也会失效），一旦掉线就需要重新打开网页认证一次。有了脚本，**掉线后最多 2 分钟自动恢复**，你再也不用管它。
+>
+> 附带的 5.6 节解决另一个烦人问题：**夜里断网导致整夜高频重试**。
+
+### 5.1 抓包获取认证请求
+
+1. 浏览器打开 `http://172.16.2.2`，按 **F12** → 切到 **Network（网络）** 标签 → 勾选 **Preserve log（保留日志）**
+2. 点击页面上的【**注销**】，页面会跳到登录页
+3. 选择你的运营商、输入账号密码，点击登录
+4. 在 Network 列表里找到那条 login 请求（名字里含 `login`）
+5. 右键那条请求 → **Copy** → **Copy link address**，把完整 URL 保存下来
+
+![F12 抓 login 请求](图片占位-抓包login请求.png)
+<!-- 建议截图：F12 → Network 面板里那条 login 请求（把右侧的 Request URL 也截进去），学号部分记得打码 -->
+
+### 5.2 解密查看真实参数（Dr.COM 的请求是 AES 加密的）
+
+把 URL 里 `params=` 后面那一长串复制出来，打开 Windows PowerShell 执行：
+
+```powershell
+$raw='把 params 后面那一长串粘贴到这里'
+$b=[Convert]::FromBase64String([uri]::UnescapeDataString($raw))
+$a=[System.Security.Cryptography.Aes]::Create()
+$a.Mode='ECB';$a.Padding='PKCS7'
+$a.Key=[Text.Encoding]::ASCII.GetBytes('5c1d5ad4dea0e8dd')
+[Text.Encoding]::UTF8.GetString($a.CreateDecryptor().TransformFinalBlock($b,0,$b.Length))
+```
+
+会输出类似这样的明文：
+
+```json
+{"login_method":1,"user_account":",b,<你的学号>","user_password":"<你的密码>",
+ "wlan_user_ip":"172.20.111.121","wlan_user_mac":"<路由器WAN-MAC>",
+ "authex_enable":"2","jsVersion":"4.2.1","rcn":"IKuKbx4H", ...}
+```
+
+重点看三个字段：
+
+| 字段 | 含义 |
+|---|---|
+| `user_account` | 账号。注意前面有个 `,b,` 前缀（见坑 10） |
+| `authex_enable` | 运营商编号（`2` = 移动） |
+| `rcn` | 会话随机串，**每次登录都要重新获取**（脚本会自动处理） |
+
+![解密后的明文参数](图片占位-解密参数输出.png)
+<!-- 建议截图：PowerShell 解密后输出的 JSON（账号、密码打码），重点圈出 user_account / authex_enable / rcn 三个字段 -->
+
+### 5.3 部署自动登录脚本
+
+在路由器上创建 `/etc/campus-login.sh`，把下面的账号信息和运营商参数改成你自己的：
+
+```bash
+#!/bin/sh
+# ============================================================
+#  校园网自动登录 (Dr.COM eportal)
+#  触发: /etc/hotplug.d/iface/99-campus-login (WAN 上线时)
+#        crontab 定时保活
+#  手动测试: FORCE=1 /etc/campus-login.sh
+#  详细说明: cat /root/campus-login-README.txt
+# ============================================================
+
+# ============ 【账号配置区】换运营商只改这里 ============
+ACCOUNT="<你的学号>"        # 学号/账号
+PASSWORD="<你的密码>"       # 密码
+ACCT_PREFIX=",b,"           # 设备前缀: PC+非无感知=",b,"  手机+非无感知=",a,"
+                            #           PC+无感知=",0,"    手机+无感知=",1,"
+ACCT_SUFFIX=""              # 运营商账号后缀: 移动=留空  电信="@dx"  联通="@lt"
+ISP="2"                     # 运营商编号(authex_enable): 当前 2 = 移动
+                            #   ⚠ 换运营商请先抓包确认新值,方法见 README
+# =====================================================
+
+PORTAL="172.16.2.2"         # 认证服务器
+PPORT="801"                 # 认证端口
+API="http://$PORTAL:$PPORT/eportal/portal"
+JVER="4.2.1"                # 门户版本
+KEYHEX="35633164356164346465613065386464"   # AES key = "5c1d5ad4dea0e8dd"
+LOG="/root/campus-login.log"
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
+    logger -t campus-login "$1" 2>/dev/null
+}
+
+# 日志轮转(保留最近 500 行)
+if [ -f "$LOG" ] && [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 500 ]; then
+    tail -n 300 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+fi
+
+# ---------- AES 加密 / URL 编码 ----------
+aes_enc() {
+    printf '%s' "$1" \
+      | openssl enc -aes-128-ecb -K "$KEYHEX" -nosalt 2>/dev/null \
+      | openssl base64 -A
+}
+urlenc() {
+    printf '%s' "$1" | sed -e 's/+/%2B/g' -e 's|/|%2F|g' -e 's/=/%3D/g'
+}
+
+# ---------- 取 WAN 的 IP 和 MAC ----------
+WIP=$(ip -4 addr show wan 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+WMAC=$(cat /sys/class/net/wan/address 2>/dev/null | tr -d ':')
+if [ -z "$WIP" ] || [ -z "$WMAC" ]; then
+    log "ERROR: no wan ip/mac (ip=$WIP mac=$WMAC)"
+    exit 1
+fi
+
+# ---------- 已经在线就直接退出(门户探测:204 且响应为空) ----------
+if [ "$FORCE" != "1" ]; then
+    if wget -q -O /tmp/_204 -T 5 \
+         "http://connect.rom.miui.com/generate_204" 2>/dev/null \
+       && [ ! -s /tmp/_204 ]; then
+        rm -f /tmp/_204
+        exit 0
+    fi
+    rm -f /tmp/_204
+fi
+log "offline detected, starting login (ip=$WIP mac=$WMAC)"
+
+# ---------- 第一步:动态获取 rcn(每次登录前都要新的) ----------
+IPB64=$(printf '%s' "$WIP" | openssl base64 -A | tr -d '\n')
+CFGJSON="{
+  \"program_index\": \"pc_70\",
+  \"wlan_vlan_id\": \"0\",
+  \"wlan_user_ip\": \"$IPB64\",
+  \"wlan_user_ipv6\": \"\",
+  \"wlan_user_ssid\": \"\",
+  \"wlan_user_areaid\": \"\",
+  \"wlan_ac_ip\": \"\",
+  \"wlan_ap_mac\": \"\",
+  \"gw_id\": \"\"
+}"
+CFGENC=$(urlenc "$(aes_enc "$CFGJSON")")
+CFGRESP=$(wget -q -O - -T 10 --header="User-Agent: $UA" \
+    "$API/page/loadConfig?params=$CFGENC&v=$((RANDOM % 9000 + 500))&lang=zh&callback=dr1003" 2>/dev/null)
+RCN=$(printf '%s' "$CFGRESP" | sed -n 's/.*"rcn":"\([^"]*\)".*/\1/p')
+log "rcn=[$RCN]"
+
+# ---------- 第二步:提交登录(最多试 5 次) ----------
+TRY=1
+while [ "$TRY" -le 5 ]; do
+    LOGINJSON="{
+  \"login_method\": 1,
+  \"user_account\": \"$ACCT_PREFIX$ACCOUNT$ACCT_SUFFIX\",
+  \"user_password\": \"$PASSWORD\",
+  \"wlan_user_ip\": \"$WIP\",
+  \"wlan_user_ipv6\": \"\",
+  \"wlan_user_mac\": \"$WMAC\",
+  \"wlan_ac_ip\": \"\",
+  \"wlan_ac_name\": \"\",
+  \"authex_enable\": \"$ISP\",
+  \"jsVersion\": \"$JVER\",
+  \"login_t\": \"0\",
+  \"js_status\": \"0\",
+  \"is_page\": \"1\",
+  \"is_page_new\": $((RANDOM % 9500 + 500)),
+  \"terminal_type\": 1,
+  \"lang\": \"zh-cn\",
+  \"rcn\": \"$RCN\"
+}"
+    ENC=$(urlenc "$(aes_enc "$LOGINJSON")")
+    RESP=$(wget -q -O - -T 10 --header="User-Agent: $UA" \
+        "$API/login?callback=dr1003&params=$ENC&jsVersion=$JVER&v=$((RANDOM % 9500 + 500))&lang=zh" 2>/dev/null)
+    SHORT=$(printf '%s' "$RESP" | head -c 160)
+
+    case "$RESP" in
+        *'"result":1'*|*'"result":"ok"'*|*'clientip online'*)
+            log "LOGIN OK (try $TRY): $SHORT"
+            exit 0
+            ;;
+        *error5*)
+            log "disconnect window (error5), retry after 5s"
+            sleep 5
+            ;;
+        *)
+            log "LOGIN FAILED (try $TRY): $SHORT"
+            sleep 3
+            ;;
+    esac
+    TRY=$((TRY + 1))
+done
+
+log "give up after 5 tries"
+exit 1
+```
+
+```bash
+chmod 700 /etc/campus-login.sh      # 注意是 700,因为里面有密码
+```
+
+> **⚠️ 注意**：教程里的脚本为了方便阅读，把超长 JSON 折成了多行（JSON 允许换行，功能不受影响），已在路由器上实测登录成功。
+
+### 5.4 配置自动触发
+
+**① WAN 上线自动登录**：创建 `/etc/hotplug.d/iface/99-campus-login`
+
+```bash
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$INTERFACE" = "wan" ] || exit 0
+(
+  echo "$(date '+%F %T') [hotplug] wan ifup detected" >> /root/campus-login.log
+  i=0
+  while [ $i -lt 30 ]; do
+    ip -4 addr show wan 2>/dev/null | grep -q 'inet ' && break
+    sleep 2; i=$((i+1))
+  done
+  sleep 8
+  /etc/campus-login.sh
+) >/dev/null 2>&1 &
+```
+
+```bash
+chmod 755 /etc/hotplug.d/iface/99-campus-login
+```
+
+**② 定时保活**：LuCI → 系统 → 计划任务（或直接编辑 `/etc/crontabs/root`），加入两行：
+
+```bash
+*/2 * * * * /etc/campus-login.sh >/dev/null 2>&1
+40 6 * * * /sbin/ifdown wan; sleep 5; /sbin/ifup wan
+```
+
+- 第一行：**每 2 分钟**检查一次，掉线自动重登
+- 第二行：每天 **6:40 重载一次 WAN 口**，防止路由器长时间运行"假死"
+
+![计划任务配置](图片占位-计划任务配置.png)
+<!-- 建议截图：LuCI → 系统 → 计划任务 里那两行的界面（或 cat /etc/crontabs/root 的输出） -->
+
+### 5.5 测试
+
+```bash
+/etc/campus-login.sh             # 在线时应静默退出(无输出)
+FORCE=1 /etc/campus-login.sh     # 强制走一次完整登录
+cat /root/campus-login.log       # 看到 LOGIN OK 就成功了
+```
+
+成功日志长这样：
+
+```text
+2026-10-03 13:43:27 offline detected, starting login (ip=172.20.111.121 mac=<路由器WAN-MAC>)
+2026-10-03 13:43:28 LOGIN OK (try 1): dr1003({"result":1,"msg":"Portal协议认证成功！"})
+```
+
+![自动登录成功日志](图片占位-自动登录日志.png)
+<!-- 建议截图：cat /root/campus-login.log 的输出，能看到 LOGIN OK（有几次重登记录更好） -->
+
+### 5.6 夜间断网窗口处理（避免整夜高频重试）
+
+很多学校的宿舍网有"**夜间断网**"策略：到点后上不了网。这时如果脚本照常每 2 分钟重试一遍，**一整夜会产生大量无意义的重登** —— 既可能引起账号风控，也会把日志刷爆。
+
+> **关键认识：「断网」和「密码错」必须区别对待** —— 断网时应该安静等待，密码错时才需要告警。
+
+#### 5.6.1 先判断你们学校属于哪一种
+
+| 类型 | 表现 | 日志特征 |
+|---|---|---|
+| **A 明确型** | 门户直接报 `error5`（Dr.COM 的"断网窗口"），或干脆不响应 | 日志出现 `disconnect window (error5)` 或 `rcn=[]` |
+| **B 隐蔽型** | 认证照常成功，但网络就是不通；且每隔几分钟踢一次会话 | 整夜 `LOGIN OK` 与 `offline detected` 交替循环 |
+
+我们学校属于 **B 型**：整夜认证都能成功，但只有认证服务器可达（**围墙花园模式**），其余全断，并且每约 5 分钟踢一次会话。所以两套方案都写上，按自己学校的情况选。
+
+![夜间断网时的日志](图片占位-夜间断网日志.png)
+<!-- 建议截图：整夜的日志片段（offline detected → LOGIN OK 循环），能看出每隔几分钟一次 -->
+
+#### 5.6.2 方案 A：error5 / 门户无响应 → 立即退避
+
+适用于 A 型学校。在 AES 加密函数之前加这三个函数：
+
+```bash
+BACKOFF_FILE=/tmp/campus-login.backoff
+QUIET_MARK=/tmp/campus-login.quiet
+
+# 是否处于"夜间断网"疑似时段: 周日至周四 23:00 起; 周五周六 23:30 起; 06:00 结束
+in_night_window() {
+    _h=$(date +%H | sed 's/^0//'); _m=$(date +%M | sed 's/^0//'); _w=$(date +%u)
+    _now=$((_h * 60 + _m))
+    case "$_w" in
+        5|6) _start=$((23 * 60 + 30)) ;;      # 周五、周六
+        *)   _start=$((23 * 60)) ;;           # 其余日期
+    esac
+    _end=$((6 * 60))
+    [ "$_now" -ge "$_start" ] || [ "$_now" -lt "$_end" ]
+}
+
+in_backoff() {                                # 是否还在退避期内
+    [ -f "$BACKOFF_FILE" ] || return 1
+    _bt=$(cat "$BACKOFF_FILE" 2>/dev/null || echo 0)
+    [ "$(date +%s)" -lt "$_bt" ]
+}
+
+set_backoff() {                               # 夜间 15 分钟, 白天 10 分钟
+    if in_night_window; then _bk=900; else _bk=600; fi
+    echo $(( $(date +%s) + _bk )) > "$BACKOFF_FILE"
+    if [ ! -f "$QUIET_MARK" ]; then
+        : > "$QUIET_MARK"
+        log "[断网窗口] 进入安静模式: 退避 ${_bk}s, 不再每 2 分钟重试"
+    fi
+}
+```
+
+然后在 **4 个位置**各加一段（位置很重要）：
+
+```bash
+① "offline detected, starting login" 之后:
+   if [ "$FORCE" != "1" ] && in_backoff; then exit 0; fi
+
+② log "rcn=[$RCN]" 之后（门户没响应 → RCN 为空）:
+   if [ -z "$RCN" ]; then set_backoff; exit 0; fi
+
+③ case 里的 error5 分支（原来 sleep 5 继续重试 5 次）改成:
+   *error5*)
+       set_backoff
+       exit 0
+       ;;
+
+④ "登录成功"分支里加恢复记录:
+   if [ -f "$QUIET_MARK" ]; then
+       rm -f "$QUIET_MARK" "$BACKOFF_FILE"
+       log "[断网窗口] 校园网已恢复, 自动登录成功"
+   fi
+```
+
+#### 5.6.3 方案 B（适用于 B 型学校）：连续记账 → 整夜静默
+
+思路：既然门户永远返回"认证成功"，那就换一个信号 —— 用「**认证成功之后，很快又检测到不通**」这件事本身来判断断网窗口。连续出现 3 次，就认定进入夜间断网，直接静默到第二天早上 06:00。
+
+在方案 A 的函数后面再加这三个：
+
+```bash
+RELAPSE_FILE=/tmp/campus-login.relapse   # 内容: "连续次数 上次登录时间戳"
+NIGHT_MARK=/tmp/campus-login.nightquiet  # 内容: 静默到期时间戳; 删除它可手动解除
+WAKE_HOUR=6                              # 每天早上 6 点恢复检测
+
+# 距下一个 WAKE_HOUR 整点还有多少秒（纯算术，不依赖 date -d）
+seconds_to_wake() {
+    _h=$(date +%H | sed 's/^0//'); _m=$(date +%M | sed 's/^0//'); _s=$(date +%S | sed 's/^0//')
+    _now_sec=$((_h * 3600 + _m * 60 + _s))
+    _wake=$((WAKE_HOUR * 3600))
+    if [ "$_now_sec" -lt "$_wake" ]; then
+        echo $((_wake - _now_sec))
+    else
+        echo $((86400 - _now_sec + _wake))
+    fi
+}
+
+in_night_quiet() {                       # 是否处于夜间静默期
+    [ -f "$NIGHT_MARK" ] || return 1
+    _until=$(cat "$NIGHT_MARK" 2>/dev/null || echo 0)
+    [ "$(date +%s)" -lt "$_until" ]
+}
+
+note_success() {                         # 登录成功后调用: 连续记账
+    _now=$(date +%s)
+    _cnt=0; _last=0
+    if [ -f "$RELAPSE_FILE" ]; then
+        _cnt=$(awk '{print $1}' "$RELAPSE_FILE" 2>/dev/null)
+        _last=$(awk '{print $2}' "$RELAPSE_FILE" 2>/dev/null)
+    fi
+    case "$_cnt"  in ''|*[!0-9]*) _cnt=0  ;; esac
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    # 只有"夜间窗口内 + 距上次登录不超过 20 分钟"才算连续
+    if [ "$_last" -gt 0 ] && [ $((_now - _last)) -le 1200 ] && in_night_window; then
+        _cnt=$((_cnt + 1))
+    else
+        _cnt=1
+    fi
+    echo "$_cnt $_now" > "$RELAPSE_FILE"
+    if [ "$_cnt" -ge 3 ]; then
+        echo $((_now + $(seconds_to_wake))) > "$NIGHT_MARK"
+        rm -f "$BACKOFF_FILE"
+        log "[夜间断网] 连续 ${_cnt} 次认证成功但网络不通, 判定进入夜间断网窗口, 静默到 ${WAKE_HOUR}:00 不再重登"
+    fi
+}
+```
+
+再改两处：
+
+```bash
+① 在 "offline detected, starting login" 之前插入静默闸门:
+
+   # 夜间静默期: 上面的在线探测已失败, 但现在是断网窗口 → 不重登, 直接退出
+   if [ "$FORCE" != "1" ] && in_night_quiet; then exit 0; fi
+   # 静默期已过 → 清除标记, 恢复正常检测
+   if [ -f "$NIGHT_MARK" ] && [ "$FORCE" != "1" ]; then
+       rm -f "$NIGHT_MARK" "$RELAPSE_FILE"
+       log "[夜间断网] 静默期结束, 恢复自动登录检测"
+   fi
+
+② 在 log "LOGIN OK (try $TRY): $SHORT" 之前插入一行:
+
+   note_success
+```
+
+#### 5.6.4 两套方案怎么选
+
+| 情况 | 选哪套 |
+|---|---|
+| 日志里能看到 `error5` 或 `rcn=[]` | 方案 A（立刻退避）即可 |
+| 整夜 `LOGIN OK` 但网络不通、且被周期性踢会话 | 方案 B（连续记账 → 整夜静默） |
+| 不确定 | **两套都加上，互不冲突** |
+
+#### 5.6.5 断网时间表（按自己学校调整）
+
+| 日期 | 断网时间 | 恢复时间 |
+|---|---|---|
+| 周日至周四 | 23:00 | 约 06:00 |
+| 周五、周六 | 23:30 | 约 06:00 |
+
+时间表只用于两个地方：① 判断"连续记账"是否在夜间进行；② 决定静默到几点。**真正判断"是不是断网"靠的是前面的信号**，所以学校改时间也不会误判。
+
+#### 5.6.6 实测效果（我们学校，方案 B）
+
+| 指标 | 改造前 | 改造后 |
+|---|---|---|
+| 整夜重登次数 | 约 78 次（每 5 分钟一次） | **约 3 次** ✅ |
+| 整夜日志行数 | 200+ 行 | **约 12 行** ✅ |
+| 失败重试 | 0 次（门户一直接受认证） | 0 次 ✅ |
+| 早上恢复延迟 | ≤2 分钟 | ≤2 分钟（不变）✅ |
+
+实测沙盒验证（**不用等到半夜，白天就能测**）：
+
+```bash
+# 复制一份脚本改成测试版：探测地址改死地址、状态文件重定向、夜间判定强制为真
+sed -e 's|http://connect.rom.miui.com/generate_204|http://127.0.0.1:9/dead|' \
+    -e 's|^LOG=.*|LOG="/tmp/t-login.log"|' \
+    -e 's|^RELAPSE_FILE=.*|RELAPSE_FILE=/tmp/t.relapse|' \
+    -e 's|^NIGHT_MARK=.*|NIGHT_MARK=/tmp/t.night|' \
+    /etc/campus-login.sh > /tmp/t-login.sh
+sed -i 's|^in_night_window() {|in_night_window() { return 0;|' /tmp/t-login.sh
+
+# 连跑 4 次，看状态机
+for i in 1 2 3 4; do sh /tmp/t-login.sh; cat /tmp/t.relapse 2>/dev/null; done
+
+# 预期结果: 连续次数 1 → 2 → 3（并生成静默标记）→ 第 4 次静默退出（日志 0 新增）
+```
+
+#### 5.6.7 ⚠️ 踩坑记录
+
+**坑 1：busybox 算术不支持 `10#` 前缀**
+
+```bash
+_now=$((10#$_h * 60 + 10#$_m))       # ❌ 路由器上直接报 arithmetic syntax error
+                                     #    busybox ash 不支持 base#number 语法
+# 正确做法: 先用 sed 去掉前导零, 再算数
+_h=$(date +%H | sed 's/^0//'); _m=$(date +%M | sed 's/^0//')
+_now=$((_h * 60 + _m))               # ✅
+```
+
+**坑 2：不要依赖 `date -d` 算时间**
+
+```bash
+until=$(date -d "tomorrow 06:00" +%s)   # ⚠️ busybox 的 date -d 支持不全, 容易失败
+# 正确做法: 用"距零点多少秒"做纯算术(见 seconds_to_wake 函数) ✅
+```
+
+**坑 3：中文字符别直接通过管道喂给路由器**
+
+```bash
+# 把带中文的脚本直接管道给 ssh | sh -s 时, 中文可能被编码破坏(变成 ????)
+# 可靠做法: 脚本存成本地文件 → scp 上传 → 在路由器上本地执行 ✅
+```
+
+> **教训总结**：路由器是 **busybox 环境**，bash 的语法糖和 GNU 工具的参数不能直接搬过来 —— 改完必须实测。
+
+#### 5.6.8 手动控制与回滚
+
+```bash
+rm -f /tmp/campus-login.nightquiet    # 立即解除夜间静默
+FORCE=1 /etc/campus-login.sh          # 强制登录一次(跳过所有判断)
+vi /etc/campus-login.sh               # 改 WAKE_HOUR=6 可调整早上恢复检测的时间
+
+cp /etc/campus-login.sh /etc/campus-login.sh.bak    # 改造前先备份
+cp /etc/campus-login.sh.bak /etc/campus-login.sh    # 出问题一键回滚
+```
+
+---
+
+## 第 6 章　验证清单：怎么确认全都生效了
+
+> **本章解决什么问题**：装完之后一项一项对，确认**每一层都真的在工作**（而不是"看起来在工作"）。
+
+| 要验证的东西 | 怎么验证 | 期望结果 |
+|---|---|---|
+| UA 改写 | 访问 `http://httpbin.org/user-agent` | 返回设定的真实 UA |
+| TTL 统一 | `iptables -t mangle -L POSTROUTING -n -v` | pkts 计数在增长 |
+| IPID 统一 | `iptables -t mangle -L IPID_MOD -n -v` | MARK 行计数在增长 |
+| NTP 劫持 | `iptables -t nat -L ntp_force_local -n -v` | DNAT 行有计数 |
+| 自动登录 | `FORCE=1 /etc/campus-login.sh` | 日志出现 `LOGIN OK` |
+| 开机自启 | 重启路由器后看日志 | 自动登录 + 防护规则都在 |
+| UAmask 运行 | `ps w \| grep UAmask` | 有进程 |
+| 硬件加速未绕过 | `cat /sys/kernel/debug/hnat/hook_toggle` | `disabled`（见 4.6） |
+| 定时任务 | `cat /etc/crontabs/root` | 两条规则都在 |
+
+> **【成功】最彻底的验证**：直接**重启路由器**，然后什么都不做。
+>
+> 1~2 分钟后如果网络自动恢复，且 UA 仍是设定的那个真实 UA，说明整套系统闭环了。
+
+![一键体检脚本输出](图片占位-体检脚本输出.png)
+<!-- 建议截图：第 9 章那个 router_check.sh 的输出（一堆 [OK]），这张图很有说服力 -->
+
+---
+
+## 第 7 章　踩坑大全（15 个坑，血泪总结）
+
+> **本章解决什么问题**：出问题的时候当"故障字典"查。这 15 个坑全是真实遇到过的 —— 包括那些"现象很吓人、原因很蠢"的。
+
+### 坑 1：UA3F 和 UAmask 到底选哪个？
+
+**结论：选 UAmask（本文）。**
+
+原因：UAmask 作者参考 UA3F 思路做了性能优化，资源占用更低、被踢概率更小；UA3F 功能更全但更吃资源。两个都装了也没关系，但【**只能启用一个**】。
+
+### 坑 2：网上教程的规则有拼写错误
+
+很多流传的教程文本里，iptables 规则被排版搞坏了，直接复制会导致**规则静默失败**：
+
+| 错误写法 | 正确写法 |
+|---|---|
+| `-jRETURN` | `-j RETURN` |
+| `--set-xmark0x10/0x10` | `--set-xmark 0x10/0x10` |
+| `-d 192.168.0.0/16-j RETURN` | `-d 192.168.0.0/16 -j RETURN` |
+| `--tcp-flags ACKACK` | `--tcp-flags ACK ACK` |
+
+> **【注意】** 复制规则后务必用 `iptables -t mangle -S` 检查一下，看看规则是不是真的进去了。
+
+### 坑 3：规则"写了但没生效"
+
+**现象**：`iptables -L` 里根本看不到你写的链。
+
+原因通常是：
+
+- 规则语法错误（见坑 2），iptables 报错但你没注意
+- 写进了 `/etc/firewall.user`，但你的系统是 **fw4(nftables)**，这个文件根本不会被执行
+- 改了 `rc.local` 但没重启也没手动执行
+
+**解决**：把规则放进独立脚本 `/etc/l3_anti_detect.sh`，由 `/etc/rc.local` 调用，改完手动跑一次验证。
+
+### 坑 4：NTP 重定向地址写死了
+
+教程里常见的 `-j DNAT --to-destination 192.168.1.1` 是**别人家的路由器地址**。如果你的路由器是 `192.168.6.1`，这条规则会把所有 NTP 请求指向一个不存在的地址，导致所有设备时间同步失败。
+
+**必须改成你自己的 LAN IP。**
+
+### 坑 5：fw4 系统与 iptables 的关系
+
+ImmortalWrt 24.10 用 **fw4(nftables)**，但系统里的 `iptables` 命令其实是 `xtables-nft-multi`（nft 版的 iptables），所以本文的规则可以用。但如果你的固件里 `iptables` 指向 `iptables-legacy` 而内核没有 legacy 模块，就会报 `Incompatible with this kernel`，**所有规则失效**。
+
+```bash
+ls -la /usr/sbin/iptables      # 看它指向哪个多合一程序
+```
+
+![iptables 指向 xtables-nft-multi](图片占位-iptables指向.png)
+<!-- 建议截图：ls -la /usr/sbin/iptables 的输出，能看到指向 xtables-nft-multi -->
+
+### 坑 6：校园网重启后需要重新认证
+
+**现象**：路由器一重启，网就断了，要手动打开认证页重新登录。
+
+**解决（双保险）**：
+
+- 在校园网认证页面打开【**无感知认证**】—— 让学校记住你的路由器 MAC，下次自动放行
+- 部署自动登录脚本（第 5 章）—— 无感知失效时的兜底
+
+### 坑 7：日志写太频繁会磨损 flash
+
+有些教程的脚本每分钟写一行日志（"网络正常！"），一天上千次写入，长期会**磨损路由器闪存**。
+
+**正确做法**：只在"需要登录"时写日志，在线检查不写。
+
+### 坑 8：路由器跑久了"假死"
+
+**解决**：定时任务里加一条每天凌晨重载 WAN 口：
+
+```bash
+40 6 * * * /sbin/ifdown wan; sleep 5; /sbin/ifup wan
+```
+
+WAN 重新拨号后，hotplug 会自动触发登录，用户无感。
+
+### 坑 9：Dr.COM 的登录请求不是普通 GET
+
+Dr.COM eportal 的接口参数是 **AES 加密**后放在 `params` 里的，直接重放抓包 URL 有时会失效（因为 `rcn` 会变）。本文脚本的做法是：每次登录前先调 `loadConfig` 接口**动态获取新的 rcn**，再现场构造请求 —— 更稳。
+
+| 参数 | 值 |
+|---|---|
+| 加密算法 | AES-128-ECB + PKCS7 |
+| 密钥(ASCII) | `5c1d5ad4dea0e8dd` |
+| 密文编码 | Base64 后 URL 编码 |
+| 登录接口 | `http://172.16.2.2:801/eportal/portal/login` |
+| 配置接口 | `http://172.16.2.2:801/eportal/portal/page/loadConfig` |
+
+### 坑 10：账号前面的 `,b,` 是什么
+
+这是 Dr.COM 的**设备前缀**，用来区分登录方式：
+
+| 前缀 | 含义 |
+|---|---|
+| `,b,` | PC + 非无感知（普通网页登录，本文使用） |
+| `,a,` | 手机 + 非无感知 |
+| `,0,` | PC + 无感知 |
+| `,1,` | 手机 + 无感知 |
+
+### 坑 11：运营商是怎么传的
+
+运营商由**两个字段共同决定**：
+
+- `authex_enable`：运营商编号（GUT 实测：`2` = 移动）
+- `user_account` 后缀：部分运营商需要（电信 `@dx`、联通 `@lt`，移动留空）
+
+**换运营商必须重新抓包确认这两个值，不能猜。**
+
+### 坑 12：苹果手机 / 应用宝会触发检测
+
+- 苹果手机如果开了"**私有 WiFi 地址**"（MAC 随机化），换一次 MAC 就可能被判定为**新设备**
+- 电脑上运行**腾讯应用宝**下载手机游戏，流量特征会暴露多设备
+
+### 坑 13：装完插件忘了"保存并应用"
+
+LuCI 里改完配置一定要点【**保存并应用**】，只点【保存】**不会生效**。
+
+### 坑 14：只做一层防护不够稳
+
+只改 UA 也能用，但被踢概率高一些。**建议组合**：UA 改写（必做）+ TTL/IPID（可选）+ 自动登录兜底（强烈建议）。
+
+### 坑 15（第 15 个坑在附录 D）
+
+第 15 个坑是"用 PowerShell 中转脚本文本会损坏 UTF-8 中文并把两行合并" —— 这个坑非常隐蔽，导致过"端口凭空消失、登录必然失败"，详见附录 D。
+
+---
+
+## 第 8 章　日常维护与换运营商
+
+> **本章解决什么问题**：系统跑起来之后，怎么改密码、换运营商、看日志、以及万一想全部卸掉。
+
+### 8.1 常用命令速查
+
+```bash
+cat /root/campus-login.log          # 看自动登录日志
+/etc/campus-login.sh                # 手动检查一次(在线时静默退出)
+FORCE=1 /etc/campus-login.sh        # 强制走一次登录
+vi /etc/campus-login.sh             # 修改账号/密码/运营商
+/etc/l3_anti_detect.sh              # 重新应用防检测规则
+ps w | grep UAmask                  # 看 UA 插件是否在跑
+/etc/init.d/cron restart            # 重启定时任务
+logread | tail -20                  # 看系统日志
+```
+
+### 8.2 换运营商
+
+1. **抓包**：浏览器打开 `http://172.16.2.2`，F12 → Network → Preserve log → 注销 → 选新运营商登录
+2. 找到 login 请求 → Copy link address，取出 `params=` 后面的内容
+3. **解密**：用 5.2 节的 PowerShell 命令解密，读出 `user_account` 后缀和 `authex_enable` 的值
+4. **改脚本**：编辑 `/etc/campus-login.sh`，改 `ACCT_SUFFIX` 和 `ISP` 两个变量
+5. **测试**：执行 `FORCE=1 /etc/campus-login.sh`，看日志是否 `LOGIN OK`
+
+### 8.3 改了校园网密码
+
+编辑 `/etc/campus-login.sh`，把 `PASSWORD="..."` 改成新密码，然后 `FORCE=1` 测试一次。
+
+### 8.4 想彻底卸载
+
+```bash
+# 停用自动登录
+rm -f /etc/campus-login.sh /etc/hotplug.d/iface/99-campus-login
+sed -i '/campus-login/d' /etc/crontabs/root
+/etc/init.d/cron restart
+
+# 停用防检测规则
+sed -i '/l3_anti_detect/d' /etc/rc.local
+iptables -t mangle -F IPID_MOD; iptables -t mangle -X IPID_MOD
+iptables -t mangle -D POSTROUTING -j TTL --ttl-set 64
+iptables -t nat -F ntp_force_local; iptables -t nat -X ntp_force_local
+
+# 恢复硬件加速(如果你关了它)
+echo 1 > /sys/kernel/debug/hnat/hook_toggle
+
+# 卸载 UA 插件(LuCI → 系统 → 软件包 → 找到 UAmask → 卸载)
+```
+
+---
+
+## 第 9 章　陌生设备管控（防火墙白名单 + 流量限制）
+
+> **本章解决什么问题**：校园网账号是**实名**的，"一号两设备"意味着同一个账号下的所有行为都记在你头上。本章让"其他设备/访客设备"连上你的路由器时**用不了翻墙和不良网站**，同时你自己的设备**完全不受影响**。
+>
+> 这一章内容多，不急的话可以先跳过 —— 前面几章跑稳了再回来。
+
+### 9.1 为什么需要这一章
+
+校园网账号是实名认证的，而"一号两设备"的策略意味着：**同一个账号下的所有行为都记在你头上**。如果室友、访客连上你的路由器，他们翻墙、访问不良网站等行为，最终追责到的是**账号持有人**。
+
+所以需要一个机制：
+
+- **自己的设备** → 完全放行（包括你自己的梯子、OneDrive、GitHub）
+- **其他设备（室友 / 访客 / 陌生设备）** → 限制翻墙和不良网站
+
+> **注意**：这里的关键是「**按设备区分**」，不能全局生效 —— 否则你自己的梯子也会一起挂掉。
+
+### 9.2 设计思路
+
+```text
+                     ┌── 白名单设备（自己）  →  完全放行，不受任何限制
+校园网 ← 路由器 ─────┤
+                     └── 其他设备（室友/陌生）→  三重限制
+                            ① 禁 VPN / 代理端口
+                            ② 强制 DNS 走路由器（让域名黑名单生效）
+                            ③ 拦 DoT / DoH（防止用加密 DNS 绕过黑名单）
+```
+
+白名单的实现方式有两种，**建议都配上**：
+
+| 方式 | 说明 | 优点 | 缺点 |
+|---|---|---|---|
+| **固定 IP 白名单** | 把设备 IP 写进防火墙规则 | 稳定、精确 | 设备换 IP 就掉出白名单 |
+| **主机名自动同步** | 每 5 分钟从 DHCP 租约里按主机名找 IP 并更新 | 不怕手机 MAC 随机化 | 需要 cron 定时任务 |
+
+### 9.3 三层限制的实现
+
+#### ① 禁止 VPN / 代理端口
+
+把常见的翻墙协议端口全部封掉（TCP+UDP），这是最基础也最有效的一层：
+
+```bash
+# 常见 VPN / 代理端口
+VPN_PORTS="1194 1723 1701 500 4500 51820 1080 3128 8118 8388 8888 10808 10809 9050 9001 1087 2080"
+
+for p in $VPN_PORTS; do
+    iptables -t filter -A CAMPUS_RESTRICT -p tcp --dport $p -j REJECT --reject-with tcp-reset
+    iptables -t filter -A CAMPUS_RESTRICT -p udp --dport $p -j REJECT
+done
+```
+
+| 端口 | 对应协议/工具 |
+|---|---|
+| 1194 | OpenVPN |
+| 1723 / 1701 | PPTP / L2TP |
+| 500 / 4500 | IPSec / IKEv2 |
+| 51820 | WireGuard |
+| 1080 / 3128 / 8118 | SOCKS5 / HTTP 代理 |
+| 8388 | Shadowsocks（默认端口） |
+| 10808 / 10809 / 1087 / 2080 | v2ray / Clash 常用本地或远端端口 |
+| 9050 / 9001 | Tor |
+
+#### ② 强制 DNS 走路由器（双 dnsmasq 架构）
+
+如果只做域名黑名单，对方只要把手机 DNS 改成 `8.8.8.8` 就**绕过**了。所以必须把受限设备的 DNS 请求**劫持到路由器上**，再用一个「带黑名单」的 DNS 来应答。
+
+架构：**两个 dnsmasq 各司其职**：
+
+| 实例 | 端口 | 服务对象 | 是否带黑名单 |
+|---|---|---|---|
+| 主 dnsmasq（系统自带） | 53 | 白名单设备 | 否 |
+| **受限 dnsmasq（新建）** | **5353** | 受限设备（经劫持） | **是** |
+
+```bash
+# 把受限设备的 53 端口劫持到 5353（白名单设备直接 RETURN 放行）
+iptables -t nat -N DNS_FORCE
+iptables -t nat -A DNS_FORCE -s 192.168.6.128 -j RETURN   # 白名单
+iptables -t nat -A DNS_FORCE -p udp --dport 53 -j REDIRECT --to-ports 5353
+iptables -t nat -A DNS_FORCE -p tcp --dport 53 -j REDIRECT --to-ports 5353
+iptables -t nat -I PREROUTING 1 -s 192.168.6.0/24 -p udp --dport 53 -j DNS_FORCE
+iptables -t nat -I PREROUTING 2 -s 192.168.6.0/24 -p tcp --dport 53 -j DNS_FORCE
+```
+
+受限 dnsmasq 的配置（`/etc/dnsmasq-restrict.conf`）：
+
+```ini
+port=5353
+no-resolv
+server=202.193.80.72           # 学校 DNS
+server=202.193.80.73
+no-hosts
+cache-size=2000
+log-facility=/tmp/dnsmasq-restrict.log
+addn-hosts=/etc/restrict_hosts_bad.txt     # 大批量精确域名黑名单
+address=/google.com/#                      # 单条规则封"域名+所有子域名+IPv4/IPv6"
+```
+
+![双 dnsmasq 架构示意](图片占位-双dnsmasq架构.png)
+<!-- 建议截图 / 画图：设备 → 53 端口被劫持 → 5353 受限 DNS → 命中黑名单返回 0.0.0.0 -->
+
+#### ③ 域名黑名单的两种写法（重要区别）
+
+| 写法 | 匹配范围 | 适用场景 |
+|---|---|---|
+| `addn-hosts=/文件` | **仅精确域名**（不封子域名） | 大批量列表（本项目用了 15.5 万条） |
+| `address=/域名/#` | 域名 + **所有子域名** + IPv4/IPv6 全封 | 少量重点域名（机场/翻墙目标） |
+
+> **踩坑提醒**：`address=/域名/0.0.0.0` 只封 **IPv4**，IPv6（AAAA）会漏过去；要写成 `address=/域名/#` 才能把 A 和 AAAA 一起封（返回 `0.0.0.0` 与 `::`）。
+
+#### ④ 拦 DoT / DoH（防止用加密 DNS 绕过）
+
+```bash
+# DoT（DNS over TLS）直接用 853 端口，封掉即可
+iptables -t filter -A CAMPUS_RESTRICT -p tcp --dport 853 -j REJECT --reject-with tcp-reset
+iptables -t filter -A CAMPUS_RESTRICT -p udp --dport 853 -j REJECT
+
+# 常见公共 DNS / DoH 服务器 IP 也一并封掉
+BLOCK_DNS_IPS="8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1 9.9.9.9 149.112.112.112 \
+  208.67.222.222 208.67.220.220 223.5.5.5 223.6.6.6 119.29.29.29 \
+  180.76.76.76 114.114.114.114 114.114.115.115"
+for ip in $BLOCK_DNS_IPS; do
+    iptables -t filter -A CAMPUS_RESTRICT -d $ip -j REJECT
+done
+```
+
+> **说明**：DoH 走的是 **443 端口**（和 HTTPS 一样），无法靠端口封 —— 只能封已知的 DoH 服务器 IP。真正要彻底拦 DoH 需要 **DPI**，一般路由器性能扛不住。
+
+### 9.4 白名单与「手机 MAC 随机化」的坑
+
+现在手机默认开启「**随机 MAC**」（隐私保护），同一台手机在不同时间会拿到**不同 MAC → 不同 IP**。如果白名单只按 IP 写死，你手机换个 MAC 就会被当成陌生设备限制掉。
+
+**解决办法：按「主机名」自动识别。** DHCP 租约文件 `/tmp/dhcp.leases` 里记录了每台设备的主机名，而手机的主机名（如 `<你的手机主机名>`）通常不会变。
+
+```bash
+# 取租约: 过期时间 MAC IP 主机名 ClientID
+# 1791060317 <白名单设备1-MAC> 192.168.6.128 <你的电脑> 01:<白名单设备1-MAC>
+
+sync() {
+    NEW=""
+    for pat in $HOSTPATTERNS; do          # HOSTPATTERNS="<你的电脑主机名> <你的手机主机名>"
+        ip=$(awk -v p="$pat" 'index($4,p)>0 {print $3; exit}' /tmp/dhcp.leases)
+        [ -n "$ip" ] && NEW="$NEW $ip"
+    done
+    NEW="$NEW $STATIC_WHITELIST"          # 固定 IP 作为兜底
+    NEW=$(echo $NEW | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+    if [ "$NEW" != "$WHITELIST" ]; then
+        WHITELIST="$NEW"
+        sed -i "s|^WHITELIST=.*|WHITELIST=\"$WHITELIST\"|" /etc/campus_restrict.sh
+        install >/dev/null 2>&1
+    fi
+}
+# crontab: 每 5 分钟自动同步一次白名单
+*/5 * * * * /etc/campus_restrict.sh sync >/dev/null 2>&1
+```
+
+### 9.5 完整部署文件
+
+路由器上共 4 个文件：
+
+| 文件 | 作用 |
+|---|---|
+| `/etc/campus_restrict.sh` | 主脚本：管理防火墙规则与白名单（install/uninstall/sync/status） |
+| `/etc/dnsmasq-restrict.conf` | 受限 DNS 配置（端口 5353 + 黑名单） |
+| `/etc/restrict_hosts_bad.txt` | 不良网站黑名单（15.5 万条域名） |
+| `/etc/init.d/campus_restrict` | 开机自启：应用规则 + 启动受限 DNS |
+
+核心脚本骨架（完整版在路由器上）：
+
+```bash
+#!/bin/sh
+IPT=iptables
+LAN_NET="192.168.6.0/24"
+STATIC_WHITELIST="192.168.6.128"                       # 固定白名单 IP
+HOSTPATTERNS="<你的电脑主机名> <你的手机主机名>"       # 按主机名自动识别
+WHITELIST="192.168.6.128 192.168.6.170"                # 当前白名单
+
+install() {
+    uninstall >/dev/null 2>&1
+    $IPT -t filter -N CAMPUS_RESTRICT
+    $IPT -t filter -I FORWARD 1 -j CAMPUS_RESTRICT
+    for ip in $WHITELIST; do $IPT -t filter -A CAMPUS_RESTRICT -s "$ip" -j RETURN; done
+    $IPT -t filter -A CAMPUS_RESTRICT ! -s $LAN_NET -j RETURN      # 非局域网不管
+    for p in $VPN_PORTS; do ... done                              # 封端口
+    for ip in $BLOCK_DNS_IPS; do ... done                         # 封外部 DNS
+    ...                                                           # 建 DNS_FORCE 劫持链
+}
+
+case "$1" in
+    install) install ;;
+    uninstall) uninstall ;;
+    sync) sync ;;          # 从 DHCP 租约自动更新白名单
+    status) status ;;
+esac
+```
+
+开机自启（`/etc/init.d/campus_restrict`）：
+
+```bash
+#!/bin/sh /etc/rc.common
+# 校园网 - 陌生设备限制(防火墙 + 受限 DNS)
+# 用 procd 守护受限 DNS：挂掉秒级自动重启
+USE_PROCD=1
+START=95
+STOP=10
+
+start_service() {
+    /etc/campus_restrict.sh install          # 应用防火墙规则
+    procd_open_instance
+    procd_set_param command /usr/sbin/dnsmasq -k --conf-file=/etc/dnsmasq-restrict.conf
+    procd_set_param respawn 3600 5 5         # 关键：挂掉自动重启
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    /etc/campus_restrict.sh uninstall
+}
+```
+
+### 9.6 实测验证结果
+
+受限设备（模拟）解析结果：
+
+| 域名 | 结果 | 说明 |
+|---|---|---|
+| `google.com` | `0.0.0.0` / `::` | 已封锁 ✅ |
+| `example-adult.com` | `0.0.0.0` / `::` | 已封锁 ✅（IPv6 也封） |
+| `example-vpn.com` | `0.0.0.0` / `::` | 已封锁 ✅（`address=` 规则，含子域名） |
+| `example-proxy.com` | `0.0.0.0` / `::` | 已封锁 ✅ |
+| `baidu.com` | `110.242.74.102` | 正常解析 ✅ |
+| `mirrors.tuna.tsinghua.edu.cn` | 正常解析 | 正常 ✅ |
+
+白名单设备（自己的电脑）解析结果：
+
+| 域名 | 结果 |
+|---|---|
+| `google.com` | `142.250.197.78`（正常，未被限制）✅ |
+| `baidu.com` | `124.237.177.164` ✅ |
+
+规则与计数器：
+
+```text
+端口封锁规则: 50 条
+DNS 劫持规则: 2 条
+受限 DNS 监听: 5353 正常
+不良网站黑名单: 155012 条
+代理/翻墙黑名单: 65 条
+白名单放行命中: 2028 包（证明规则确实在链路上）
+```
+
+![受限设备解析被拦的测试结果](图片占位-黑名单测试.png)
+<!-- 建议截图：在受限设备上 nslookup 的结果（被封的域名返回 0.0.0.0） -->
+
+### 9.7 日常管理命令
+
+```bash
+# 查看状态（白名单 + 规则 + 命中计数）
+/etc/campus_restrict.sh status
+
+# 临时关闭全部限制
+/etc/campus_restrict.sh uninstall
+
+# 永久关闭（取消开机自启）
+/etc/init.d/campus_restrict disable
+
+# 手动同步白名单（手机换 MAC 后立即生效）
+/etc/campus_restrict.sh sync
+
+# 修改屏蔽的网站域名
+vi /etc/dnsmasq-restrict.conf
+/etc/init.d/campus_restrict restart
+```
+
+增加白名单设备（两种方式）：
+
+```bash
+# 方式1：按主机名（推荐，能应对手机 MAC 随机化）
+vi /etc/campus_restrict.sh
+#   HOSTPATTERNS="<你的电脑主机名> <你的手机主机名> 新设备主机名"
+/etc/campus_restrict.sh sync
+
+# 方式2：按固定 IP
+vi /etc/campus_restrict.sh
+#   STATIC_WHITELIST="192.168.6.128 192.168.6.xxx"
+/etc/campus_restrict.sh install
+```
+
+### 9.8 局限（必须知道的实话）
+
+- **① 无法 100% 阻止翻墙**：把代理套在 CDN 后面、跑在 443 端口的（Trojan/VLESS+CDN），光看端口和域名是**识别不出来**的。要拦住需要 DPI 深度包检测，一般路由器性能扛不住。
+- **② 域名黑名单拦的是"获取途径"**（机场网站、订阅域名），不是"使用结果"。如果对方已经拿到可用节点，仍然能连出去（除非再加"禁境外 IP"那一层）。
+- **③ 黑名单需要维护**：机场域名变化很快，公开列表源大多已失效，本项目用的是自建清单（65 个常见域名），覆盖面有限。
+- **④ 如果以后校园网开通了 IPv6**：`addn-hosts` 那份 15.5 万条的黑名单**只封了 IPv4**，需要给每条补一行 `:: 域名` 才能连 IPv6 一起封（`address=` 规则没有这个问题）。
+- **⑤ 白名单需要维护**：新增自己的设备要记得加进去，否则会被当成陌生设备限制。
+
+### 9.9 本章踩坑记录（真实遇到的）
+
+| # | 坑 | 原因与解决 |
+|---|---|---|
+| 1 | 脚本上传后报 `#!/bin/sh: not found` | Windows 写文件带了 **UTF-8 BOM**，shell 把 BOM 当成命令的一部分。解决：用 `[IO.File]::WriteAllText` + `UTF8Encoding($false)` 写出**无 BOM** 文件 |
+| 2 | shell 报 `syntax error: unexpected end of file` | 文件是 **CRLF 换行**。解决：上传前把 `\r\n` 全部替换为 `\n`（LF） |
+| 3 | `nslookup -port=5353` 测黑名单一直"正常解析" | **Windows 的 nslookup 会忽略 `-port` 参数**，请求实际打到了 53 端口（主 DNS，没有黑名单）。解决：用"临时把自己移出白名单"的方法走真实劫持路径测试 |
+| 4 | PowerShell 里 `$R` 变量突然变成字符串 | PowerShell **变量名不区分大小写**，`$r` 和 `$R` 是同一个变量，循环里赋值把它覆盖了 |
+| 5 | PowerShell 自定义函数 `R` / `SSH` 莫名报错 | `R` 是 `Invoke-History` 的内置别名；函数名 `SSH` 会**遮蔽原生 ssh 命令导致无限递归**。解决：用不会撞名的函数名或 scriptblock |
+| 6 | crontab 里那行变成一堆文件名 | 写 crontab 时用双引号包裹 `*/5 * * * *`，经过多层传递后引号丢失，shell 把 `*` 当通配符展开了。解决：用**单引号**，或把命令写进脚本文件 |
+| 7 | dnsmasq 报 `bad option at line 1` | 配置文件同样带了 **BOM**。解决：无 BOM 写出 |
+| 8 | 测试限制时把自己也关在外面 | 测试前一定要确认**白名单里有自己正在用的设备 IP/主机名**，否则测试完自己也上不了网 |
+| 9 | 重启系统 dnsmasq 后黑名单静默失效 | 受限 DNS 是**另一个独立的 dnsmasq 实例**，执行 `/etc/init.d/dnsmasq restart` 会把它**一起杀掉**，黑名单就静默失效了（表面上网正常，但限制没了）。★ 推荐解决：用 **procd 守护**（`USE_PROCD=1` + `procd_set_param respawn`），挂掉秒级自动重启；再在 cron 里加一道兜底（每 5 分钟检查 5353 端口，没监听就拉起） |
+
+### 9.10 与"方案③：禁境外 IP"的关系
+
+本章实现的是"**加强档**"。还有一个更彻底的方案：对受限设备**只允许访问国内 IP**（用国内 IP 段白名单实现）。
+
+- **优点**：翻墙**彻底不可能**（不是拦途径，是拦结果）
+- **缺点**：GitHub、Steam 商店、部分海外服务会**一起失效**
+
+本项目没有启用这一层，因为当时白名单机制还没就绪。现在有了设备白名单，这一层可以做到「**对白名单设备零影响**」—— 如果将来想加，只需对受限设备再加一条「非国内 IP 段一律 REJECT」的规则即可。
+
+### 9.11 给设备加备注名（便于识别谁是谁）
+
+默认情况下 DHCP 租约列表里显示的是设备**自己上报的主机名** —— 手机常常只报随机字符串，电脑则可能是 `<某台笔记本主机名>` 这种出厂名，根本认不出是谁。可以给设备加一个自定义备注名。
+
+**做法：静态 DHCP 租约 + `name` 字段**
+
+```bash
+uci set dhcp.my_device=host
+uci set dhcp.my_device.name='备注名'        # 注意：必须是 ASCII，不能写中文
+uci set dhcp.my_device.mac='<MAC地址>'
+uci set dhcp.my_device.ip='192.168.6.xxx'   # 顺便把 IP 也固定住
+uci commit dhcp
+/etc/init.d/dnsmasq restart
+```
+
+或者在 LuCI 里点两下：
+
+- 状态 → DHCP 租约 → 找到那台设备 → 点「**设为静态**」→ 填名字和 IP → 保存 ✅
+
+![DHCP 租约列表 / 设为静态](图片占位-DHCP租约列表.png)
+<!-- 建议截图：LuCI → 状态 → DHCP 租约 的列表（主机名和 MAC 打码），以及"设为静态"的弹窗 -->
+
+本项目实际配置：
+
+| IP | 备注名 | 说明 |
+|---|---|---|
+| 192.168.6.128 | `<你的电脑主机名>` | `<白名单设备1>`（白名单放行） |
+| 192.168.6.170 | `<你的手机主机名>` | `<白名单设备2>`（白名单放行，按主机名自动同步） |
+| 192.168.6.141 | `<其他设备1>` | `<其他设备1>`（受限） |
+| 192.168.6.117 | `<其他设备2>` | `<其他设备2>`（受限） |
+
+> **⚠️ 踩坑：备注名绝对不能用中文**
+
+实测把 `name` 写成中文（如 `<其他设备1>-笔记本`），重启 dnsmasq 会**直接失败**：
+
+```text
+daemon.crit dnsmasq: bad DHCP host name at line 26
+daemon.crit dnsmasq: FAILED to start up
+```
+
+**原因**：这个 `name` 字段同时会被注册成 DNS 主机名（`名字.lan`），而 DNS 标签**必须是 ASCII 字符** ❌
+
+**正确做法**：用拼音（`<其他设备1>`）；中文只写在配置文件的注释里方便自己看：
+
+```bash
+# /etc/config/dhcp 末尾（uci 会保留注释）
+# 192.168.6.128  <你的电脑主机名>    = <白名单设备1>
+# 192.168.6.170  <你的手机主机名>    = <白名单设备2>
+# 192.168.6.141  <其他设备1>         = <其他设备1>(受限)
+# 192.168.6.117  <其他设备2>         = <其他设备2>(受限)
+```
+
+> **特别注意**：如果 dnsmasq 因为中文主机名启动失败，失效的是**整个网络的 DNS**（不只是黑名单），所有设备都会上不了网 —— 所以改完**一定要确认 dnsmasq 起来了**。
+
+最后提醒：给设备加备注名**只影响"显示"**，不会改变限制策略 —— 受限设备仍然受限。
+
+### 9.12 路由器安全体检与加固
+
+> **本节解决什么问题**：整套系统跑起来之后，还有一件常被忽略的事 —— **路由器本身就是最大的风险点**。它里面存着你的校园网账号密码、全部限制规则、WiFi 密码 —— 一旦失守，前面所有伪装等于白做。
+
+#### 9.12.1 威胁模型：谁能碰到你的路由器
+
+| 来源 | 能否碰到路由器 | 说明 |
+|---|---|---|
+| 校园网（WAN 侧） | ❌ 被防火墙挡住 | WAN 区 input 策略是 REJECT，外部服务无法访问路由器 |
+| 你自己的设备（LAN） | ✅ 可以 | 正常管理入口 |
+| 室友的设备（LAN） | ⚠️ 可以 | 和你在同一个局域网 —— **这才是真正要防的对象** |
+| 访客 / 连过 WiFi 的设备 | ⚠️ 可以 | 只要有 WiFi 密码就在同一网段 |
+
+**结论**：漏洞主要来自「**局域网内部**」。所以加固原则是 —— **能少开一个监听端口，就少开一个**。
+
+#### 9.12.2 体检清单（照着查一遍）
+
+| 检查项 | 命令 | 期望值 |
+|---|---|---|
+| 防火墙 WAN 策略 | `uci get firewall.@zone[1].input` | `REJECT` |
+| 端口转发/DMZ | `uci show firewall \| grep -c redirect` | `0` |
+| ttyd 网页终端 | `pidof ttyd` | 无输出（已关闭） |
+| LuCI 强制 HTTPS | `uci get uhttpd.main.redirect_https` | `1` |
+| SSH 绑定接口 | `uci get dropbear.main.Interface` | `lan` |
+| TTL=64 规则 | `iptables -t mangle -S POSTROUTING \| grep -c 'ttl-set 64'` | `1` |
+| IPID 链 | `iptables -t mangle -S \| grep -c IPID_MOD` | `>=1` |
+| NTP 强制本地 | `iptables -t nat -S \| grep -c ntp_force_local` | `>=1` |
+| ★硬件加速绕过 | `cat /sys/kernel/debug/hnat/hook_toggle` | `disabled`（**别只看 OFFLOAD**，见 4.6） |
+| 白名单放行规则 | `iptables -t filter -S CAMPUS_RESTRICT \| grep -c RETURN` | = 白名单设备数+1 |
+| 端口封锁规则 | `iptables -t filter -S CAMPUS_RESTRICT \| grep -c REJECT` | 50 |
+| 受限 DNS 监听 | `netstat -lnup \| grep -c 5353` | 2（IPv4+IPv6） |
+| 登录脚本权限 | `ls -l /etc/campus-login.sh` | `-rwx------` |
+| 联网状态 | `wget -q -O /dev/null http://connect.rom.miui.com/generate_204` | 成功 |
+
+#### 9.12.3 本次发现并修复的 4 个问题
+
+**① ttyd 网页终端（高危）**
+
+固件自带 `luci-app-ttyd`，它把路由器终端做成了网页，监听 `192.168.6.1:7681`，背后接的是 `/bin/login` —— 输入 root 密码就能在浏览器里拿到完整 root shell。它在 `/etc/rc.d/` 里有 `S99ttyd`，**开机自动运行**。
+
+风险：局域网内所有人（含室友）都能打开这个页面，而且是**明文 HTTP**，可被嗅探和暴力破解。
+
+```bash
+# 关闭并取消自启
+/etc/init.d/ttyd stop
+/etc/init.d/ttyd disable
+
+# 验证：应无输出、7681 无监听、rc.d 里无 S99ttyd
+pidof ttyd
+netstat -lnt | grep 7681
+ls /etc/rc.d/ | grep ttyd
+
+# 想恢复
+/etc/init.d/ttyd enable && /etc/init.d/ttyd start
+```
+
+![关闭 ttyd 前后对比](图片占位-关闭ttyd.png)
+<!-- 建议截图：pidof ttyd 无输出 + netstat 里 7681 没有监听的对比图 -->
+
+**② LuCI 明文登录（中危）**
+
+uhttpd 同时监听 80 和 443，而 `redirect_https='0'` 意味着你输 `http://` **不会**被跳到 https —— 登录密码会以**明文**在局域网里传输，同网段抓包就能拿到。
+
+```bash
+# 强制跳转 HTTPS
+uci set uhttpd.main.redirect_https='1'
+uci commit uhttpd
+/etc/init.d/uhttpd restart
+
+# 验证：HTTP 应返回 307 并带 Location: https://...；HTTPS 应正常返回 200
+curl -sS -i http://192.168.6.1/ | head -3
+curl -sS -k -i https://192.168.6.1/ | head -3
+```
+
+> **注意**：第一次用 HTTPS 打开会提示"证书不受信任"（**自签证书，正常现象**），点「高级 → 继续前往」即可；之后把书签改成 `https://192.168.6.1` 就不会再提示。
+
+**③ WAN 主机名暴露路由器身份（中危）**
+
+`udhcpc` 启动参数里带着 `-x hostname:ImmortalWrt` —— 也就是说，学校的 DHCP 服务器能看到"用这个账号的设备叫 **ImmortalWrt**"，而你整套伪装的目标是让它看起来像一台 **Windows 电脑**，两者自相矛盾。
+
+```bash
+# 改成一个 Windows 电脑样子的名字（用你电脑的真实主机名最自然）
+uci set network.wan.hostname='<你的电脑主机名>'
+uci commit network
+ifup wan            # 重新申请 DHCP，让学校收到新主机名
+
+# 验证：udhcpc 参数应为 -x hostname:<你的电脑主机名>
+ps w | grep "[u]dhcpc"
+# 验证：日志里应能看到一次完整的 DHCP 交互
+logread | grep -i udhcpc | tail -6
+
+# 想撤销
+uci delete network.wan.hostname; uci commit network; ifup wan
+```
+
+**为什么风险低**：MAC 和 IP 都没变，在学校眼里还是同一台设备，不会触发"新设备"判定；主机名变化对 Windows 电脑来说本来就很常见。
+
+**④ 没有任何配置备份（高危）**
+
+路由器一挂或刷坏，这套系统就得从零重配 —— 而这个系统的配置量很大。所以**一定要定期备份**。
+
+```bash
+# 生成配置备份（包含全部 uci 配置、cron、脚本）
+sysupgrade -b /tmp/config-backup.tar.gz
+
+# 拉回电脑保存（在电脑上执行）
+scp root@192.168.6.1:/tmp/config-backup.tar.gz D:\备份\
+
+# 需要恢复时（把备份传回路由器后）
+sysupgrade -r /tmp/config-backup.tar.gz
+```
+
+> **⚠️ 一个必须知道的坑**：`sysupgrade -b` **默认只备份 `/etc/sysupgrade.conf` 里列出的路径** —— 你自己写的脚本（`/etc/campus-login.sh`、`/etc/wanwatch.sh` 等）**默认不在里面**！
+>
+> 结果就是：备份看起来成功了，实际只有几十 KB，恢复后脚本一个都没有。**务必把这 16 个自定义路径写进 `/etc/sysupgrade.conf`** 再备份，并且**解压验证一遍**里面确实有脚本。
+
+#### 9.12.4 关键验证：硬件加速有没有绕过防检测（最容易忽略的坑）
+
+> **这是整份体检里最重要的一条**，也是本项目**踩得最深的一个坑**。
+
+360T7 的固件带了 turboacc 硬件加速（**MTK HNAT / PPE**），它的原理是：一个连接的第一个包走 netfilter 规则，之后这个连接就被**卸载到硬件上直通**。
+
+**后果**：如果 TTL 规则只对每个连接的第一个包生效，学校那边的被动检测就会看到"第一个包 TTL=64、后面的包 TTL=128(Windows 真实值)" —— **同一台设备出现混合 TTL，反而更容易被判定为多设备共享。**
+
+**我们当时是怎么验证的（❌ 错误示范）：**
+
+```bash
+# 检查有没有连接被软件方式卸载：看起来必须为 0
+grep -c OFFLOAD /proc/net/nf_conntrack
+
+# 同时看 TTL 规则的命中计数（数字很大就以为没问题）
+iptables -t mangle -L POSTROUTING -n -v
+```
+
+当时的实测结果是 `OFFLOAD = 0`、TTL 规则命中 **698 万包** —— 于是我们得出结论"防检测规则没有被绕过 ✅"。
+
+**但这个结论是错的 ⚠️。** 因为 `OFFLOAD` 只是**软件**卸载的标记，而 MTK 的 PPE 是**硬件**接管，这个标记根本看不见。后来在排查另一个问题时才发现：
+
+```bash
+cat /sys/kernel/debug/hnat/hnat_stats     # BIND_PPE0=11~22  ← 十几二十条流被硬件接管了
+cat /sys/kernel/debug/hnat/hnat_entry     # 绑定表里明确列着内网设备的流
+```
+
+**正确的关法**（而不是去动 turboacc 的配置，那条路我们试过，不生效）：
+
+```bash
+# 真正的开关在这里
+echo 0 > /sys/kernel/debug/hnat/hook_toggle      # 立即关闭（注意：只认 0/1！）
+grep BIND /sys/kernel/debug/hnat/hnat_stats       # 应变成 BIND_PPE0=0
+
+# 并写进 /etc/rc.local 持久化（否则重启就回来了）
+echo 0 > /sys/kernel/debug/hnat/hook_toggle 2>/dev/null
+```
+
+完整原理、实测测速数据和看门狗方案见 **4.6 节**。
+
+> **教训**：体检要看**硬件**状态，不能只看软件标记。这也是为什么第 9.12.8 节的看门狗后来加上了"硬件加速检查"这一项。
+
+#### 9.12.5 验证 UA 伪装真的生效（UAmask 的关键词模式）
+
+UAmask 的完整启动参数（从 `/proc/<pid>/cmdline` 读取，`ps` 会截断看不到全貌）：
+
+```bash
+/usr/bin/UAmask -port 12032 \
+  -u "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/147.0.0.0 Safari/537.36" \
+  -loglevel info -log /tmp/UAmask/UAmask.log \
+  -fw-type nft -fw-set-name UAmask_bypass_set -fw-drop -fw-bypass \
+  -fw-nonhttp-threshold 5 -fw-timeout 28800 -fw-decision-delay 60s \
+  -cache-size 3000 -buffer-size 8192 -p 500 \
+  -keywords Windows,Linux,Android,iPhone,Macintosh,iPad,OpenHarmony
+```
+
+**关键点**：`-keywords` 决定了"**只改写包含这些关键字的 UA**"。也就是说：
+
+- 换成含 `Android` / `iPhone` / `Macintosh` 等关键字的 UA → **会被改写**成统一的 Chrome/147 Windows UA ✅
+- 自造一个不含关键字的 UA（如 `TestUA/1.0`）→ **不会被改写** —— 这是正常行为，**不是故障** ✅
+
+**所以测试时必须用真实设备 UA，否则会误判成"UAmask 坏了"。**
+
+```bash
+# 正确的验证方式：用手机/苹果 UA 请求一个纯 HTTP 回显服务
+curl -sS -A "Mozilla/5.0 (Linux; Android 13; Pixel 7) ... Chrome/120.0.0.0 Mobile" \
+     http://httpbingo.org/user-agent
+# 期望输出：user-agent 变成 Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/147.0.0.0
+
+# 注意：不要用 httpbin.org 这类会 301 跳转到 HTTPS 的站点 ——
+# 443 端口的流量天然不经过 UAmask，测出来会"看似没生效"
+
+# 看运行时统计（key:value 格式）
+cat /tmp/UAmask.stats
+#   total_requests:11307
+#   successful_modifications:3708   ← 实际改写成功的次数
+#   total_cache_ratio:85.58
+```
+
+**额外发现**：UAmask 会自己处理"非 HTTP 流量"的问题 —— `-fw-nonhttp-threshold 5` 表示某个连接发了 5 个非 HTTP 包后，等 `-fw-decision-delay 60s`，就把它加进 **bypass 集合**不再拦截。所以**游戏、非标准端口的服务不会被它搞坏**。
+
+![UAmask 统计信息](图片占位-UAmask统计.png)
+<!-- 建议截图：cat /tmp/UAmask.stats 的输出，重点圈出 successful_modifications -->
+
+#### 9.12.6 低危项（知道就行）
+
+| 项 | 说明 | 建议 |
+|---|---|---|
+| WAN MAC 的 OUI | 属于国产 IoT 厂商的 OUI，不像 PC 网卡 | ⚠️ **不要改** —— 改 MAC = 学校看到新设备，风险更大 |
+| 全锥 NAT | `fullcone=1` + turboacc `fullcone=2`，映射更开放 | 打游戏留着；注重安全可关 |
+| 固件版本 | 24.10-SNAPSHOT + revision unknown（第三方构建） | 考研前**不要动固件** |
+| WiFi 密码 | 8 位、含房号，抗字典攻击中等 | 可换长随机串（其他设备需重连） |
+| 客户端隔离 | 未开启，同网段设备可访问你电脑的共享端口 | 需要投屏/互传就**别开** |
+| 登录脚本重试 | 每轮 5 次 × 每 2 分钟 = 最坏 150 次/小时 | ⚠️ 密码若失效可能触发锁号，建议加退避（见 5.6） |
+
+#### 9.12.7 一键体检脚本
+
+把下面的脚本存成 `/etc/router_check.sh`（`chmod +x`），以后随时 `sh /etc/router_check.sh` 一键自查：
+
+```bash
+#!/bin/sh
+# ============================================================
+# 路由器安全体检   用法: sh /etc/router_check.sh
+# 输出带状态标记: [OK]通过 [!!]警告 [XX]异常 [--]信息
+# 桌面【校园网工具箱】的 [4] 路由器安全体检 就是远程调用它
+# ============================================================
+PASS=0; WARN=0; FAIL=0
+ok()   { PASS=$((PASS+1)); printf "  [OK] %-20s : %s\n" "$1" "$2"; }
+warn() { WARN=$((WARN+1)); printf "  [!!] %-20s : %s\n" "$1" "$2"; }
+bad()  { FAIL=$((FAIL+1)); printf "  [XX] %-20s : %s\n" "$1" "$2"; }
+info() { printf "  [--] %-20s : %s\n" "$1" "$2"; }
+
+echo "===== 路由器安全体检 $(date '+%Y-%m-%d %H:%M') ====="
+
+echo ""
+echo "[网络暴露面]"
+V=$(uci get firewall.@zone[1].input 2>/dev/null)
+[ "$V" = "REJECT" ] && ok "防火墙 WAN input" "$V" || bad "防火墙 WAN input" "$V"
+V=$(uci show firewall 2>/dev/null | grep -c redirect)
+[ "$V" = "0" ] && ok "端口转发 / DMZ" "$V 条" || bad "端口转发 / DMZ" "$V 条"
+if pidof ttyd >/dev/null 2>&1; then bad "ttyd 网页终端" "运行中,建议关闭"; else ok "ttyd 网页终端" "已关闭"; fi
+V=$(uci get uhttpd.main.redirect_https 2>/dev/null)
+[ "$V" = "1" ] && ok "LuCI 强制 HTTPS" "已启用" || warn "LuCI 强制 HTTPS" "未启用"
+V=$(uci get dropbear.main.Interface 2>/dev/null)
+[ "$V" = "lan" ] && ok "SSH 绑定接口" "$V" || warn "SSH 绑定接口" "$V"
+
+echo ""
+echo "[防检测核心]"
+V=$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'ttl-set 64')
+[ "$V" -gt 0 ] && ok "TTL 统一 64" "规则在" || bad "TTL 统一 64" "规则缺失"
+V=$(iptables -t mangle -S 2>/dev/null | grep -c 'IPID_MOD')
+[ "$V" -gt 0 ] && ok "IPID 统一" "$V 处" || bad "IPID 统一" "规则缺失"
+V=$(iptables -t nat -S 2>/dev/null | grep -c ntp_force_local)
+[ "$V" -gt 0 ] && ok "NTP 强制本地" "$V 处" || bad "NTP 强制本地" "规则缺失"
+V=$(grep -c OFFLOAD /proc/net/nf_conntrack 2>/dev/null)
+H=$(cat /sys/kernel/debug/hnat/hook_toggle 2>/dev/null)
+B=$(grep -oE 'BIND_PPE0=[0-9]+' /sys/kernel/debug/hnat/hnat_stats 2>/dev/null | cut -d= -f2)
+if [ "$H" = "enabled" ] || [ "${B:-0}" != "0" ]; then
+    bad "硬件加速未绕过" "MTK-HNAT=$H 绑定=$B 会跳过TTL/IPID!"
+else
+    ok "硬件加速未绕过" "软件=$V MTK=${H:-未加载}"
+fi
+V=$(ps w 2>/dev/null | grep -c '[U]Amask')
+M=$(grep '^successful_modifications' /tmp/UAmask.stats 2>/dev/null | sed 's/.*://')
+[ "$V" -gt 0 ] && ok "UAmask 运行" "已改写 ${M:-0} 次" || bad "UAmask 运行" "进程未运行"
+V=$(uci get network.wan.hostname 2>/dev/null)
+[ -n "$V" ] && ok "WAN 主机名伪装" "$V" || warn "WAN 主机名伪装" "未设置"
+
+echo ""
+echo "[陌生设备管控]"
+V=$(grep '^WHITELIST=' /etc/campus_restrict.sh 2>/dev/null | cut -d'"' -f2)
+[ -n "$V" ] && ok "白名单设备" "$V" || bad "白名单设备" "读取失败"
+V=$(iptables -t filter -S CAMPUS_RESTRICT 2>/dev/null | grep -c RETURN)
+[ "$V" -ge 2 ] && ok "白名单放行规则" "$V 条" || bad "白名单放行规则" "$V 条"
+V=$(iptables -t filter -S CAMPUS_RESTRICT 2>/dev/null | grep -c REJECT)
+[ "$V" -ge 34 ] && ok "端口封锁规则" "$V 条" || bad "端口封锁规则" "$V 条"
+V=$(netstat -lnup 2>/dev/null | grep -c 5353)
+[ "$V" -gt 0 ] && ok "受限 DNS 5353" "监听中" || bad "受限 DNS 5353" "未运行"
+V=$(wc -l < /etc/restrict_hosts_bad.txt 2>/dev/null)
+[ "$V" -gt 0 ] && ok "不良网站黑名单" "$V 条" || bad "不良网站黑名单" "缺失"
+V=$(grep -c '^address=' /etc/dnsmasq-restrict.conf 2>/dev/null)
+[ "$V" -gt 0 ] && ok "翻墙域名黑名单" "$V 条" || bad "翻墙域名黑名单" "缺失"
+
+echo ""
+echo "[账号与容灾]"
+V=$(ls -l /etc/campus-login.sh 2>/dev/null | awk '{print $1}')
+[ "$V" = "-rwx------" ] && ok "登录脚本权限" "$V" || warn "登录脚本权限" "$V"
+V=$(crontab -l 2>/dev/null | grep -vc '^#')
+[ "$V" -ge 1 ] && ok "cron 任务" "$V 条" || warn "cron 任务" "无"
+info "闪存剩余" "$(df -h / | tail -1 | awk '{print $4}')"
+info "内存可用" "$(free | awk '/Mem:/{print $7}') KB"
+V=$(cat /sys/class/net/wan/speed 2>/dev/null)
+[ "${V:-0}" -ge 1000 ] && ok "WAN 链路速率" "$V Mbps" || warn "WAN 链路速率" "$V Mbps (百兆线,换 Cat5e/Cat6 可恢复)"
+
+echo ""
+echo "[联网状态]"
+if wget -q -O /dev/null -T 8 http://connect.rom.miui.com/generate_204 2>/dev/null; then
+	ok "校园网认证" "在线"
+else
+	bad "校园网认证" "离线,检查 /root/campus-login.log"
+fi
+
+echo ""
+echo "  体检结果: 通过 $PASS 项   警告 $WARN 项   异常 $FAIL 项"
+```
+
+#### 9.12.8 防检测规则看门狗
+
+防检测规则（TTL / IPID / NTP）原本只在**开机时**由 `rc.local` 加载一次。问题在于：如果之后规则被意外刷掉（防火墙重载、手滑删掉、脚本改错），它会**静默失效直到下次重启** —— 而这期间学校看到的指纹就是**乱的**。
+
+所以补了一个看门狗：**每 5 分钟检查一次，缺了就自动补回来。**
+
+检查 **5 项**：
+
+| # | 检查项 | 检查方式 | 缺失后的动作 |
+|---|---|---|---|
+| ① | TTL=64 统一 | mangle POSTROUTING 里有 `ttl-set 64` | 重新运行 `/etc/l3_anti_detect.sh` |
+| ② | IPID 统一 | mangle 表里有 `IPID_MOD` 链 | 同上 |
+| ③ | NTP 强制本地 | nat 表里有 `ntp_force_local` 链 | 同上 |
+| ④ | UAmask UA 改写链 | nft 里有 `UAmask_prerouting` 链 | 重启 UAmask 服务 |
+| ⑤ | **硬件加速已关闭** | `/sys/kernel/debug/hnat/hook_toggle` ≠ `enabled` | `echo 0` 写回（见 4.6） |
+
+工作流程：
+
+```text
+每 5 分钟（cron）:
+  */5 * * * * /etc/anti_detect_watchdog.sh >/dev/null 2>&1
+
+  检查 5 项 ──► 都正常? ──是──► 静默退出（不写日志、不占资源）
+                    │
+                    否
+                    ↓
+              重新应用规则 → 等 4 秒 → 复查
+                    ↓
+              记录日志：修复成功 / 修复失败(提示手动检查)
+
+日志位置: /tmp/anti_detect_watchdog.log （超过 200 行自动截断）
+同时写入系统日志: logger -t anti_detect
+```
+
+实测（故意删掉 TTL 规则验证）：
+
+```bash
+# 1. 手动删掉 TTL 规则，模拟"规则被刷掉"
+iptables -t mangle -D POSTROUTING -j TTL --ttl-set 64
+#   确认: iptables -t mangle -S POSTROUTING | grep -c "ttl-set"   → 0
+
+# 2. 跑一次看门狗
+sh /etc/anti_detect_watchdog.sh
+
+# 3. 结果：4 秒内自动恢复并复查通过
+cat /tmp/anti_detect_watchdog.log
+  2026-10-03 20:08:35 检测到 TTL=64 规则缺失，正在重新应用
+  2026-10-03 20:08:39 修复成功：4 项规则已全部恢复 ✅
+```
+
+后来加上硬件加速检查之后，再测一次（手动 `echo 1` 打开 → 跑看门狗）：
+
+```text
+2026-10-04 16:50:25 检测到硬件加速(HNAT)被开启，正在关闭(否则TTL/IPID会被绕过)
+2026-10-04 16:50:29 修复成功：5 项检查(含硬件加速)已全部正常 ✅
+```
+
+手动使用方法：
+
+```bash
+sh /etc/anti_detect_watchdog.sh status   # 看 5 项规则当前状态 + 最近的修复记录
+sh /etc/anti_detect_watchdog.sh          # 立即检查并修复一次（静默模式）
+```
+
+**为什么这个看门狗比"再写一个开机脚本"更有用：**
+
+- 开机脚本只覆盖"**重启后**"这一种情况；看门狗覆盖"**运行中被刷掉**"的情况
+- 规则被刷掉是**最危险**的一类故障 —— 因为它**没有任何外在表现**：网照常能上、速度照常，只有学校那边的指纹变了
+- 配合 4.6 的"硬件加速绕过检查"，防检测这一层现在有了**完整的自检与自愈能力**
+
+### 9.13 境外流量监测（只记录，不阻断）
+
+> **本节解决什么问题**：第 9 章前面的思路是"**拦住**"（端口 / 域名 / DNS）。但还有一个更温和也更实用的选择：**不拦，只记录** —— 保留其他设备的正常使用（Steam、GitHub、OneDrive 都能用），但你能随时看到"哪台设备、在什么时候、连了哪些境外 IP、传了多少数据"。
+
+#### 9.13.1 为什么选"只记录"而不是"硬拦"
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **硬拦（方案③）** | 非白名单设备只允许访问国内 IP | ⚠️ 其他设备的海外服务**全废**（Steam 商店 / GitHub / OneDrive 都不行） |
+| **只记录（本节）** | 不阻断，但把境外连接全部记下来 | ✅ 谁都不受影响；你掌握**事实与证据** |
+
+**关键认识**：翻墙流量和正常海外服务跑在**同一批 CDN / 云**上（实测 Steam 商店在 Akamai、GitHub 在 Azure），所以"精准放行正常服务、只拦翻墙"在技术上**做不到完美**。既然拦不干净，那就先做到「**看得见**」。
+
+#### 9.13.2 技术原理（内核分类 + 用户态汇总）
+
+```text
+  ┌─ 内核态（零拷贝，判断一次）──────────────────────────┐
+  │  nft set "cn_ip"   : 4298 条国内 IP 段（哈希表）      │
+  │  nft set "wl"      : 白名单设备 IP                    │
+  │  chain wanmark     : hook forward priority -150       │
+  │    受限设备 且 目的IP不在 cn_ip  →  ct mark 0xf00d    │
+  └──────────────────────────────────────────────────────┘
+                        ↓ 每分钟
+  ┌─ 用户态（cron: wanwatch.sh scan）───────────────────┐
+  │  读 /proc/net/nf_conntrack, 挑出带标记的连接         │
+  │  聚合: 设备 + 目标IP + 端口 → 累计字节 / 首末时间    │
+  └──────────────────────────────────────────────────────┘
+                        ↓
+  报告 + 域名反查（受限 DNS 日志里有 域名→IP 的对应关系）
+```
+
+两个设计要点：
+
+- 判断"是不是境外"放在**内核**做（nft set 哈希查询）—— 不用调用任何程序，性能开销可以忽略
+- 判断结果写成 **conntrack 标记**而不是日志 —— 不会刷爆系统日志，也不会磨损闪存
+
+#### 9.13.3 部署
+
+```bash
+# 脚本放到 /etc/wanwatch.sh 后执行：
+sh /etc/wanwatch.sh setup
+
+# 它会做四件事：
+#   1. 下载国内 IP 段（ispip.clang.cn，约 4298 条）到 /etc/cn_ip.txt
+#   2. 建 nft set（cn_ip / wl）和标记链 wanmark
+#   3. 加定时任务：每分钟 scan，每周日 4 点 update
+#   4. 重启 cron
+```
+
+> **⚠️ 踩坑**：nftables 里 `mark` 是**保留字**，链名不能叫 `mark`，必须换名（本项目用 `wanmark`）。
+
+#### 9.13.4 实测结果
+
+```bash
+# 测试方法：临时清空白名单集(把自己变成"受限设备")，访问境外网站
+nft flush set inet wanwatch wl
+curl -sS -o /dev/null https://www.cloudflare.com/    # 产生境外流量
+
+# 内核计数应立即增长
+nft list chain inet wanwatch wanmark | grep counter
+#   counter packets 896 bytes 73693
+
+# 扫描 + 报告
+sh /etc/wanwatch.sh scan
+sh /etc/wanwatch.sh report 24
+  ── 汇总（最近 24 小时）──
+    境外流量总量 : 0.12 MB
+    独立目标数   : 6
+    涉及设备数   : 2
+
+  ── 按设备 ──
+    192.168.6.128       4 条连接       0.12 MB
+    192.168.6.170       2 条连接       0.00 MB
+
+  ── 流量最大的目标 TOP 15 ──
+         0.07 MB   192.168.6.128   -> 104.16.124.96  :443
+         0.05 MB   192.168.6.128   -> 104.16.123.96  :443
+         0.00 MB   192.168.6.170   -> 172.217.119.4  :443
+         0.00 MB   192.168.6.170   -> 172.217.112.4  :443
+```
+
+> **⚠️ 踩坑**：conntrack 的一行里有【**两组**】`src=` / `dst=`（原始方向 + 回复方向），用 awk 循环取值时**必须只取第一次出现的**，否则源和目的会搞反，导致**一条都匹配不上**。
+
+#### 9.13.5 日常使用
+
+| 命令 | 作用 |
+|---|---|
+| `sh /etc/wanwatch.sh report 24` | 看最近 24 小时的报告 |
+| `sh /etc/wanwatch.sh report 1` | 看最近 1 小时 |
+| `sh /etc/wanwatch.sh status` | 看监测是否在运行、内核匹配了多少包 |
+| `sh /etc/wanwatch.sh clear` | 清空记录 |
+| `sh /etc/wanwatch.sh update` | 手动更新国内 IP 段 |
+
+也可以直接在桌面【校园网工具箱】菜单里按 **[5] 境外流量监测**，结果会同时存成报告文件。
+
+#### 9.13.6 局限（必须知道的）
+
+- **只记录不阻断**：看到可疑流量不代表拦住了；要真拦，把 `wanmark` 链最后加一条 `reject` 即可（等于方案③）
+- **域名反查依赖"受限 DNS 日志"**：如果对方用 DoH 或直接用 IP 连接，报告里**只有 IP 没有域名**
+- **扫描粒度 1 分钟**：扫描间隔内建立并结束的短连接可能漏记（长连接和持续流量不会漏）
+- **只覆盖非白名单设备**：白名单设备（自己和指定设备）的境外流量不记录，避免自己的梯子把记录刷爆
+- **记录存在内存（/tmp）**：路由器重启后清空 —— 需要长期留存的话定期用工具箱导出报告
+
+#### 9.13.7 历史落盘（路由器重启也不丢记录）
+
+前面说过一个短板：记录存在 `/tmp`（内存），路由器一重启就清空 —— 如果对方半夜翻墙、你早上重启了路由器，那段记录就**没了**。所以必须定时落盘。
+
+做法：**每小时**把"最近 1 小时"的汇总追加一行到闪存（`/root`），一行一天几十行，闪存磨损可以忽略。
+
+```bash
+# 定时任务（setup 时自动添加）
+5 * * * * /etc/wanwatch.sh save >/dev/null 2>&1
+
+# 落盘格式: 时间 设备 境外目标数 连接数 流量MB 可疑标记
+2026-10-03 18:56 192.168.6.128 5 5 0.12
+2026-10-03 18:56 192.168.6.170 2 2 0.00
+
+# 查看历史（默认 40 行）
+sh /etc/wanwatch.sh history
+sh /etc/wanwatch.sh history 10
+```
+
+**为什么选"每小时"而不是"每天"**：万一重启，最多只丢 1 小时的记录，而不是一整天。
+
+#### 9.13.8 可疑度评估（一眼看出谁可能在翻墙）
+
+判定规则（阈值在脚本顶部可改）：
+
+| 指标 | 默认阈值 | 含义 |
+|---|---|---|
+| `SUSPECT_IPS` | ≥ 10 个 | 1 小时内连了 10 个以上**不同**的境外目标 |
+| `SUSPECT_MB` | ≥ 50 MB | 1 小时内境外流量超过 50 MB |
+| 命中任一条件 | 标记 `SUSPECT` | 报告里显示 `[XX]` 并标注"可疑，疑似代理/VPN" |
+
+```bash
+# 报告里的可疑度评估段落
+  ── 可疑度评估（最近 1 小时，阈值: ≥10个目标 或 ≥50MB）──
+    [OK] 192.168.6.128     5 个境外目标      0.12 MB
+    [OK] 192.168.6.170     2 个境外目标      0.00 MB
+
+# 把阈值临时改成 1 验证判定确实会触发：
+sed -i 's/^SUSPECT_IPS=10/SUSPECT_IPS=1/' /etc/wanwatch.sh
+sh /etc/wanwatch.sh report 2
+  ── 可疑度评估（最近 1 小时，阈值: ≥1个目标 或 ≥50MB）──
+    [XX] 192.168.6.128     5 个境外目标      0.12 MB   ← 可疑，疑似代理/VPN
+    [XX] 192.168.6.170     2 个境外目标      0.00 MB   ← 可疑，疑似代理/VPN
+sed -i 's/^SUSPECT_IPS=1/SUSPECT_IPS=10/' /etc/wanwatch.sh   # 改回来
+```
+
+**为什么用这两个指标：**
+
+- 正常的海外服务（Steam 商店、GitHub、微软登录）通常只连**少数几个目标**，流量也很小
+- 而代理 / VPN 的特征是：**短时间连很多不同境外节点**（切换线路、测速），或者**持续大流量**（看视频、下载）
+- 误报可能存在（BT 下载、系统大更新），所以判定要结合"目标数 + 流量 + 时间规律"一起看，**不要只看一次结果**
+
+#### 9.13.9 完整命令速查
+
+| 命令 | 作用 | 谁调用 |
+|---|---|---|
+| `sh /etc/wanwatch.sh setup` | 安装 / 修复全部规则与定时任务 | 手动 |
+| `sh /etc/wanwatch.sh report 24` | 看最近 24 小时报告 + 可疑度评估 | 工具箱菜单 [5] |
+| `sh /etc/wanwatch.sh history 20` | 看持久化历史（重启不丢） | 工具箱菜单 [5] |
+| `sh /etc/wanwatch.sh status` | 运行状态 / 记录数 / 阈值 | 手动 |
+| `sh /etc/wanwatch.sh save` | 立即汇总落盘一次 | cron 每小时 |
+| `sh /etc/wanwatch.sh scan` | 立即扫描一次 | cron 每分钟 |
+| `sh /etc/wanwatch.sh update` | 更新国内 IP 段 | cron 每周日 |
+| `sh /etc/wanwatch.sh clear` | 清空内存记录（历史保留） | 手动 |
+
+**系统架构回顾**：nft 规则 + 脚本 + cron + 记录文件全部在【**路由器**】上运行，**电脑关机也照常监测**；桌面工具箱只是"远程查看窗口"，顺便把报告存到电脑里。
+
+#### 9.13.10 不良网站访问监测（DNS 侧记录）
+
+9.13 前面监测的是"**境外 IP**"，但不良网站（赌博/色情等）**往往是国内 IP**，光看境外是抓不到的。所以再加一路：从受限 DNS 的日志里记录"**谁尝试访问了被黑名单拦截的域名**"。
+
+**原理**：受限设备的 DNS 已经被强制劫持到 5353 的受限 DNS（见 9.3 ②），被黑名单拦截时日志会留下这样一对记录：
+
+```text
+query[A] example-adult.com from 192.168.6.117
+/etc/restrict_hosts_bad.txt example-adult.com is 0.0.0.0       ← 被 addn-hosts 黑名单拦掉
+config google.com is 0.0.0.0                                   ← 被 address=/域名/# 规则拦掉
+```
+
+所以只要解析这个日志，就能得到"**设备 + 域名 + 时间**"三要素。系统还按关键字自动分级：
+
+| 判定 | 关键字（命中即严重） | 报告里的标记 |
+|---|---|---|
+| **严重不良内容** | `porn` / `xxx` / `sex` / `adult` / `hentai` / `jav` / `bet` / `casino` / `gambl` / `poker` / `slot` / `jackpot` / `lottery` / `escort` / `onlyfans` | `[XX]` 严重（红色） |
+| **其他被拦域名** | 多为广告、统计、遥测域名（StevenBlack 列表含这类） | `[!!]` 提示（黄色） |
+
+实测输出：
+
+```text
+  ── ② 不良网站访问尝试（被 DNS 拦截记录的，最近 24 小时）──
+    拦截尝试总数 : 3 次
+    ── 按设备汇总 ──
+    [XX] 192.168.6.128      2 次尝试  (其中严重内容 1 次, 例: example-adult.com)
+    [!!] 192.168.6.117      1 次尝试  (多为广告/遥测类, 例: aeventlog.beacon.qq.com)
+    ── 最近 10 条明细 ──
+    [XX] 10-03 18:58  192.168.6.128    example-adult.com
+    [!!] 10-03 18:58  192.168.6.128    google.com
+    [!!] 10-03 18:58  192.168.6.117    aeventlog.beacon.qq.com
+```
+
+两点说明：
+
+- 这里记录的是"**访问尝试**"而不是"**访问成功**" —— 因为域名已经被 DNS 拦掉了，设备其实连不上；但"**谁在尝试**"本身就是最重要的信号
+- 如果对方用 **DoH / 直接用 IP** 绕过 DNS，就不会出现在这里 —— 那种情况要靠第 ① 段的境外流量监测（**两条路互相补位**）
+
+#### 9.13.11 内存与闪存占用（路由器内存不大，会不会撑爆？）
+
+**结论：不会。** 因为监测数据分成两类，分别落在两个不同的地方：
+
+| 数据 | 存放位置 | 当前占用 | 增长量 |
+|---|---|---|---|
+| 实时聚合记录（境外 / 不良网站） | **内存**（`/tmp` 是 tmpfs 内存盘） | 约 112 KB | 每条约 55 字节 |
+| DNS 查询日志 | **内存**（`/tmp`） | 128 KB（自动截断） | 随查询量增长，超 512 KB 自动截断 |
+| 内核规则（4298 条国内 IP 段） | 内核内存 | 约几百 KB | 固定不变 |
+| 每小时历史汇总 | **闪存**（`/root`） | 不到 1 KB | 约 3 KB / 天 |
+| **路由器现状** | 总内存 496 MB / 可用 293 MB | 闪存剩余 27.7 MB | — |
+
+关键点是：`/tmp` 在 OpenWrt 上是 **tmpfs（内存盘）** —— 用 `df -h` 可以验证：
+
+```bash
+# df -h
+tmpfs          242.4M   1.4M   240.9M   1%  /tmp      ← 内存盘，重启清空
+overlayfs:/overlay  32.4M  3.0M  27.7M  10%  /       ← 闪存，只有历史汇总写这里
+
+# 所以：频繁写入的实时记录在内存里（不磨损闪存），
+#       每小时才往闪存写几行（一天几 KB）
+```
+
+**四重限额**（防止无限增长，全部在脚本顶部可调）：
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `KEEP_DAYS` | 7 天 | 超过 7 天没活动的记录自动清理 |
+| `MAX_AGGLINES` | 20000 行 | 聚合表行数上限 |
+| `MAX_HIST` | 5000 行 | 历史文件行数上限（超出只保留最近） |
+| `MAX_DNSLOG` | 512 KB | DNS 日志超限就**原地截断**，只留尾部 25% |
+
+> **⚠️ DNS 日志截断必须"原地截断"**（`cat` 回同一个文件），**不能用 `mv` 换文件** —— 因为 dnsmasq 持有的是原文件的 **inode**，换文件后它会继续写到已被删除的旧 inode，日志就"看起来不再更新"了。
+
+另外注意：日志截断时要同步记录"**已读位置**"（`dns.offset`）。本项目在截断后把已读位置设为**新文件大小**，这样已处理过的部分不会重复统计。
+
+#### 9.13.12 证据导出（把可疑 / 严重记录单独出一份材料）
+
+日常看报告就够了，但**真出事的时候**（其他设备翻墙被学校发现、或者你要跟对方摊牌），需要的是一份"能直接拿出来看"的**完整材料** —— 所以单独做了一个导出功能。
+
+导出文件包含四段内容和一段校验：
+
+| 部分 | 内容 |
+|---|---|
+| **文件头** | 生成时间 / 统计范围 / 路由器型号与固件 / WAN 主机名与 MAC / WAN IP / 白名单设备 / 数据来源与采集方式说明 |
+| **一、严重不良网站访问尝试** | 赌博/色情类域名（命中严重关键字），含**设备 IP + 主机名 + MAC**、访问次数、最近发生时间 |
+| **二、可疑境外流量时段** | 每小时统计中标记过 `SUSPECT` 的时段（≥10 个境外目标 或 ≥50 MB） |
+| **三、境外目标明细 TOP 20** | 流量 / 设备 / 目标 IP / 端口 / 域名反查结果 |
+| **四、涉及设备清单** | 所有涉及的设备及其主机名 + MAC（用于确认"是哪台机器"） |
+| **完整性校验** | 文件大小 + MD5 校验值（记录条数统计也在这一节） |
+
+怎么用：
+
+```bash
+# 方式一：工具箱菜单（推荐）
+校园网工具箱 -> [6] 证据导出 -> 输入天数(回车=7)
+  -> 自动在路由器生成 -> 下载到 D:\360T7备份\证据 文件夹
+
+# 方式二：命令行
+sh /etc/wanwatch-evidence.sh 7        # 导出最近 7 天
+sh /etc/wanwatch-evidence.sh 30       # 导出最近 30 天
+
+# 文件同时保存在两处：
+#   路由器: /root/evidence/evidence-YYYYmmdd-HHMM.txt   (重启不丢)
+#   电脑  : D:\360T7备份\证据\证据-YYYYmmdd-HHMMSS.txt
+```
+
+实测输出（节选）：
+
+```text
+================================================================================
+                    上网行为证据记录  （路由器自动生成）
+================================================================================
+生成时间   : 2026-10-03 19:02:12 CST
+统计范围   : 最近 7 天
+路由器型号 : Qihoo 360T7
+WAN 主机名 : <你的电脑主机名>
+WAN MAC    : <路由器WAN-MAC>
+白名单设备 : 192.168.6.128 192.168.6.170
+             （白名单设备流量不纳入本记录）
+数据来源与采集方式：
+  ① 境外连接记录：内核 nft 规则标记 conntrack（0xf00d），cron 每分钟采集
+  ② 不良网站记录：受限 DNS(5353) 日志中被拦截的域名查询
+  ③ 设备归属：DHCP 租约（IP ↔ MAC ↔ 主机名）
+================================================================================
+一、严重不良网站访问尝试（赌博/色情类，命中严重关键字）
+================================================================================
+设备           域名                        次数  最近发生时间
+---------------- -------------------------------------- ------ -------------------
+192.168.6.128    example-adult.com                    2  2026-10-03 18:59
+
+涉及设备明细：
+  192.168.6.128  ->  <你的电脑主机名> / MAC <白名单设备1-MAC>
+...
+完整性校验
+  文件大小     : 3424 字节
+  MD5 校验值   : 70cdf4b8403bd7c351bac706f4efbed7
+  （校验方法：md5sum 本文件，与上面值比对）
+```
+
+> **⚠️ 关于"能不能当证据用"，必须说清楚：**
+>
+> - 这份记录的定位是「**事实核对材料**」：能说明某台设备（有 IP + MAC + 主机名）在什么时间做了什么，用来跟对方沟通、或向学校说明情况都够用
+> - 它**不是法律意义上的取证材料** —— 那种需要公证、或者调取运营商/学校侧的日志；本项目做不到也不声称能做到
+> - 带 MD5 校验值是为了证明"这份文件**自生成后没有被改动过**"（你自己可以随时用 `md5sum` 复核）
+> - 数据只覆盖**非白名单设备**，白名单设备（自己和指定设备）的流量不在记录范围内
+
+#### 9.13.13 工具箱输出文件的统一目录
+
+为了让报告、证据和配置集中管理，桌面工具箱的所有输出统一放在 `D:\360T7备份` 下：
+
+```text
+D:\360T7备份\
+    360T7-config-*.tar.gz（路由器配置备份）、opkg-packages.txt、恢复说明.txt、文件夹说明.txt
+  报告\
+    体检报告-*.txt、境外流量监测-*.txt（工具箱 [4] [5] 的输出）
+  证据\
+    证据-*.txt（工具箱 [6] 的输出）
+  配置\
+    config.json（工具箱设置）
+```
+
+报告和证据文件可以随时删除，下次运行会重新生成；配置删掉则恢复默认设置。
+
+---
+
+## 附录 A　本次实测环境与结果
+
+| 项目 | 内容 |
+|---|---|
+| 路由器 | 360T7（MT7981B，aarch64_cortex-a53，内存改 512MB） |
+| 固件 | ImmortalWrt 24.10-SNAPSHOT（内核 6.6.133，fw4/nftables） |
+| 认证系统 | Dr.COM eportal 4.2.1（哆点认证） |
+| 认证页面 | `http://172.16.2.2:801` |
+| UA 插件 | UAmask 0.4.3-1（nft 模式，关键词模式） |
+| 实测 UA 结果 | 电脑(Windows/Edge)、安卓手机、iPhone 分别发请求 → 服务端收到的 UA **完全一致**，均为 Chrome/147 Windows 真实 UA ✅ |
+| 实测 TTL 结果 | WAN 口 tcpdump 抓包 → **所有出站包 ttl 64** ✅ |
+| 实测重启结果 | 断电重启后**自动恢复上网**，无需人工认证 ✅ |
+| 实测硬件加速 | 关闭前 BIND_PPE0=11~22 → 关闭后 = 0，TTL/IPID 才真正覆盖全部流量 ✅ |
+| 实测加速开关代价 | 交替 A/B：359 vs 397 Mbps，只差 **11%** |
+
+![WAN 口 tcpdump 抓包 TTL=64](图片占位-tcpdump验证TTL.png)
+<!-- 建议截图：在路由器 WAN 口 tcpdump 抓包的输出，能看到 ttl 64；这张图是"防检测真的生效了"的硬证据 -->
+
+## 附录 B　关键参数对照表
+
+| 参数 | 值 |
+|---|---|
+| 认证服务器 | `172.16.2.2` |
+| 登录端口 | `801` |
+| 登录接口 | `/eportal/portal/login` |
+| 配置接口 | `/eportal/portal/page/loadConfig` |
+| AES 密钥(ASCII) | `5c1d5ad4dea0e8dd` |
+| 加密模式 | AES-128-ECB / PKCS7 / Base64 |
+| 运营商 移动 | `authex_enable = 2` |
+| 运营商 电信 | `authex_enable = ?`（后缀 `@dx`） |
+| 运营商 联通 | `authex_enable = ?`（后缀 `@lt`） |
+| 路由器 LAN | `192.168.6.1` |
+| 默认日志 | `/root/campus-login.log` |
+
+## 附录 C　一句话总结
+
+> UAmask 改 UA（**必做**）→ iptables 统一 TTL/IPID（保险）→ 关掉硬件加速（否则前两条白做）→ 自动登录脚本（兜底）→ 无感知 + 每日重载（稳定）
+
+## 附录 D　补充踩坑：第 15 个坑（编辑脚本时的隐形杀手）
+
+**坑 15：用 PowerShell 中转脚本文本，会损坏 UTF-8 中文并把两行合并**
+
+**现象**：脚本里明明写的是两行 ——
+
+```bash
+PORTAL="172.16.2.2"         # 认证服务器
+PPORT="801"                 # 认证端口
+```
+
+部署到路由器后却变成了（注意**端口不见了**）：
+
+```text
+http://172.16.2.2:/eportal/portal/...     ← 端口为空，登录必然失败
+```
+
+**原因**：Windows PowerShell 5.1 的 `Get-Content` 读取**无 BOM 的 UTF-8** 文件时，会按系统 ANSI(GBK) 编码解码；中文变成乱码后重新以 UTF-8 写出，其中某个多字节序列会把**行尾的换行符一起吃掉**，导致下一行被并进注释里。
+
+**正确做法**：不要把脚本内容在 PowerShell 里"读出来再写出去"，**直接复制文件本身**：
+
+```bash
+scp 你的脚本.sh root@192.168.6.1:/etc/campus-login.sh
+```
+
+如果非要用 PowerShell 处理文本，请**显式指定编码**：
+
+```powershell
+Get-Content -Raw -Encoding UTF8 输入文件
+[IO.File]::WriteAllText(输出文件, $内容, (New-Object Text.UTF8Encoding($false)))
+```
+
+**排查技巧**：脚本行为诡异时，用 `sh -x` 追踪执行过程，一眼就能看出变量为什么是空的：
+
+```bash
+FORCE=1 sh -x /etc/campus-login.sh 2>&1 | head -40
+```
+
+> 另外提醒：教程第 5.3 节的脚本代码，为了排版清晰把超长 JSON 折成了多行（JSON 允许换行，功能不受影响），已在路由器上实测登录成功。
+
+## 附录 E　进阶：为什么最后改用"真实 UA"而不是 FFF
+
+最初的方案是把所有设备的 UA 统一改写成 `FFF`。它确实能骗过学校当前的"UA 家族计数"规则，但后来采纳了一个更稳妥的做法：**把改写值填成一个真实的浏览器 UA**。
+
+两种做法对比：
+
+| 对比项 | FFF | 真实 UA（当前采用） |
+|---|---|---|
+| 通过学校当前规则 | 通过 | 通过 |
+| 看起来像正常用户 | 否，明显是人为伪造的值 | **是，就是一台普通电脑** |
+| 若学校升级为"UA 格式/白名单校验" | 立刻暴露 | 不受影响 |
+| 网络中心人工排查流量 | 一眼看出被改写过 | 看不出异常 |
+
+最终采用的 UA（也同步写进了自动登录脚本）：
+
+```text
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36
+```
+
+实测验证（多设备一致性）：
+
+| 客户端发送的 UA | 服务端实际收到的 UA |
+|---|---|
+| Windows Edge 146 | 统一后的 Chrome/147 Windows UA |
+| Android 14 Chrome Mobile | 同上，**完全一致** |
+| iPhone Safari Mobile | 同上，**完全一致** |
+| 不含关键词的 UA（如 curl） | 原样透传，不参与改写 |
+
+也就是说，学校那边看到的是：**一个 IP、一个正常用户的 Chrome UA、一台设备。**
+
+> **一个技术细节**：UAmask 只改写 `User-Agent` 头，不改写 **Client Hints**（`Sec-CH-UA-*` 系列头）。但 Client Hints 只在 HTTPS 下由真实浏览器发送，而 HTTPS 的内容学校本来就看不到（TLS 加密），所以这个细节对防检测**没有实际影响**。
+
+如果想改回 FFF（或换成别的 UA），一条命令即可：
+
+```bash
+uci set UAmask.main.ua='FFF'
+uci commit UAmask
+/etc/init.d/UAmask restart
+```
+
+改完用手机和电脑分别访问 `http://httpbin.org/user-agent` 验证返回是否一致即可。
+
+## 附录 F　受限 DNS 为什么必须用 procd 守护
+
+> **⚠️ 关键**：受限 DNS 必须用 **procd 守护**，不要只在 `start()` 里启动一个后台进程。原因有两点：
+
+- **①** 系统 dnsmasq 执行 `restart` 时会把**所有** dnsmasq 进程一起杀掉，包括我们这一个；
+- **②** 手动启动的进程**没有进程守护**，挂了不会自动恢复 —— 表现就是"网络还能用，但黑名单**静默失效**"，很难发现。
+
+验证 procd 是否在守护（应看到 `"running": true` 和 `respawn` 参数）：
+
+```bash
+ubus call service list '{"name":"campus_restrict"}'
+```
+
+![ubus 查看 procd 守护状态](图片占位-procd守护验证.png)
+<!-- 建议截图：ubus call service list 的输出，能看到 running: true 和 respawn 参数 -->
+
+---
+
+## 参考&致谢
+
+- **学长博客《校园网防检测方案》：https://999314.xyz/posts/84ee87f6/** （本文的叙述风格也参考了学长这篇，特此致谢 —— 同一个学校、同一个坑，学长先踩过一遍）
+- UAmask 项目：https://github.com/Zesuy/UA-Mask
+- UA3F 项目：https://github.com/SunBK201/UA3F
+- UA-Mask 使用文档：https://github.com/Zesuy/UA-Mask/blob/main/docs/tutorial.md
+- 恩山无线论坛（相关讨论）：https://www.right.com.cn/forum/
+- OpenWrt 官方文档：https://openwrt.org/docs/
+- ImmortalWrt 项目：https://immortalwrt.org/
+
+---
+
+## 免责声明
+
+本文记录的是**个人在宿舍环境下学习网络技术的过程**，目的是改善自己的上网体验、顺便把遇到的问题和解决方法整理下来，仅供**技术学习与交流**使用。
+
+文中涉及的所有操作都发生在**我自己购买、自己管理的路由器**上，针对的也是**我自己付费购买的校园网账号**；不涉及破解、不涉及盗用他人账号、也不涉及攻击任何系统。
+
+需要说明的是：
+
+- **请遵守你所在学校的网络管理规定**。不同学校的管理策略不同，本文的方法不一定适用于你的环境，照做之前请先确认学校的规定是否允许
+- **不要用于商业用途**（例如把宿舍网络转卖、给他人提供上网服务），也不要用于**影响他人正常使用网络**
+- **关于账号共享**：本文讨论的"一号两设备"限制，本质是学校对账号使用范围的规定。请自行判断你的使用方式是否合规 —— 技术手段能解决"被误判"，但不改变规则本身
+- **关于设备管控那一章**：记录日志的初衷是"万一出现问题时能说清楚是哪台设备做了什么"，用于沟通和自证，**不是**为了监视他人。请不要把它用在你不该管的设备上
+- **风险自负**：刷固件、改防火墙规则都有让网络中断的风险。本文给出的每一条命令都在我的设备上实测过，但你的设备/固件版本可能不同 —— **动手前先备份配置**（见 9.12.3 ④）
+
+如果这篇教程帮到了你，或者你发现了其中的错误，欢迎在评论区指出。祝各位的网络都稳稳的 🌐
+
+---
+
+> **版权声明**：本文采用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh) 国际许可协议进行许可，转载请注明作者 **QinJackson** 及原文出处。
