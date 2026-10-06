@@ -36,9 +36,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          # submodules: true
-          # If using the 'assets' git submodule from Chirpy Starter, uncomment above
-          # (See: https://github.com/cotes2020/chirpy-starter/tree/main/assets)
+          # Required by `assets.self_host`: the theme's static assets live in
+          # https://github.com/cotes2020/chirpy-static-assets (submodule assets/lib).
+          submodules: true
 
       - name: Sync GitHub avatar
         # Pull the current avatar of the repo owner into the site build.
@@ -69,6 +69,22 @@ jobs:
         run: bundle exec jekyll b -d "_site${{ steps.pages.outputs.base_path }}"
         env:
           JEKYLL_ENV: "production"
+
+      - name: Verify self-hosted assets are present
+        # Fail fast instead of silently shipping a site without icons/fonts/TOC.
+        run: |
+          set -e
+          SITE="_site${{ steps.pages.outputs.base_path }}"
+          test -f "$SITE/assets/lib/fontawesome-free/css/all.min.css"
+          test -f "$SITE/assets/lib/fontawesome-free/webfonts/fa-solid-900.woff2"
+          test -f "$SITE/assets/lib/fontawesome-free/webfonts/fa-brands-400.woff2"
+          test -f "$SITE/assets/lib/fonts/main.css"
+          test -f "$SITE/assets/lib/tocbot/tocbot.min.js"
+          test -f "$SITE/assets/lib/glightbox/glightbox.min.js"
+          test -f "$SITE/assets/lib/clipboard/clipboard.min.js"
+          test -f "$SITE/assets/lib/simple-jekyll-search/simple-jekyll-search.min.js"
+          echo "self-hosted assets OK"
+          du -sh "$SITE/assets/lib"
 
       - name: Test site
         run: |
