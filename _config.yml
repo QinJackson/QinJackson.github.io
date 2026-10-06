@@ -128,7 +128,7 @@ comments:
   #   3) set provider: twikoo;
   #   4) allow this site in that backend CORS setting (CORS_ALLOW_ORIGIN),
   #      otherwise the browser will block the requests.
-  # The frontend js is already self-hosted (assets/vendor/twikoo/twikoo.min.js),
+  # The frontend js is already self-hosted (assets/twikoo/twikoo.min.js),
   # so there is no runtime dependency on a third-party CDN.
   twikoo:
     env_id: # e.g. https://twikoo-xxxx.vercel.app   (Tencent CloudBase: the env id)
