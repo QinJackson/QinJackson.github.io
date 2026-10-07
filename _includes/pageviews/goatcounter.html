@@ -1,0 +1,60 @@
+{%- comment -%}
+  Site-level override of the theme's _includes/pageviews/goatcounter.html
+
+  Only change vs. the theme: the failure fallback.
+    * GoatCounter answers 404 for a path that has never been visited  -> show 0
+    * any other failure (offline / blocked from China / timeout)     -> hide the counter
+      and its label entirely
+  The theme instead wrote a hardcoded '1' into the DOM on every failure, which made an
+  unvisited or unreachable page claim exactly one view.
+{%- endcomment -%}
+<!-- Display GoatCounter pageviews -->
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const pv = document.getElementById('pageviews');
+    if (pv === null) {
+      return;
+    }
+
+    const uri = location.pathname.replace(/\/$/, '');
+    const url = `https://{{ site.analytics.goatcounter.id }}.goatcounter.com/counter/${encodeURIComponent(uri)}.json`;
+
+    const hideCounter = () => {
+      const holder = pv.closest('span');
+      if (holder) {
+        holder.style.display = 'none';
+      }
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+      hideCounter();
+    }, 8000);
+
+    fetch(url, { signal: controller.signal })
+      .then((response) => {
+        clearTimeout(timer);
+        if (response.status === 404) {
+          pv.innerText = '0';
+          return null;
+        }
+        if (!response.ok) {
+          hideCounter();
+          return null;
+        }
+        return response.json();
+      })
+      .then((data) => {
+        if (data === null) {
+          return;
+        }
+        const count = String(data.count).replace(/\D/g, '');
+        pv.innerText = new Intl.NumberFormat().format(count);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        hideCounter();
+      });
+  });
+</script>

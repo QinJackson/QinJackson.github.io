@@ -1,0 +1,94 @@
+<!-- The Footer -->
+{%- comment -%}
+  Site-level override of the theme's _includes/footer.html
+
+  Only change vs. the theme: a subtle site-wide statistics line inside the copyright
+  paragraph (route A of the analytics plan: GoatCounter's public counter API, no token,
+  fetched live in the browser).
+    * rendered hidden, shown only after the numbers arrive -> no placeholder, no lie
+    * stays hidden when the request fails or times out
+  Everything else below is the theme's markup, unchanged.
+{%- endcomment -%}
+
+<footer
+  aria-label="Site Info"
+  class="
+    d-flex flex-column justify-content-center text-muted
+    flex-lg-row justify-content-lg-between align-items-lg-center pb-lg-3
+  "
+>
+  <p>
+    {{- '©' }}
+    <time>{{ 'now' | date: '%Y' }}</time>
+
+    {% if site.social.links %}
+      <a href="{{ site.social.links[0] }}">{{ site.social.name }}</a>.
+    {% else %}
+      <em class="fst-normal">{{ site.social.name }}</em>.
+    {% endif %}
+
+    {% if site.data.locales[include.lang].copyright.brief %}
+      <span
+        data-bs-toggle="tooltip"
+        data-bs-placement="top"
+        title="{{ site.data.locales[include.lang].copyright.verbose }}"
+      >
+        {{- site.data.locales[include.lang].copyright.brief -}}
+      </span>
+    {% endif %}
+
+    {%- if site.analytics.goatcounter.id -%}
+      <span id="site-stats" class="d-block small mt-1" style="display: none">
+        <i class="fas fa-chart-simple fa-fw" aria-hidden="true"></i>
+        累计浏览 <span id="stat-views">0</span> 次 ·
+        访客 <span id="stat-visitors">0</span> 位
+      </span>
+      <script>
+        (function () {
+          const box = document.getElementById('site-stats');
+          if (!box) {
+            return;
+          }
+          const url = `https://{{ site.analytics.goatcounter.id }}.goatcounter.com/counter/TOTAL.json`;
+          const controller = new AbortController();
+          setTimeout(() => {
+            controller.abort();
+          }, 8000);
+          fetch(url, { signal: controller.signal })
+            .then((response) => (response.ok ? response.json() : null))
+            .then((data) => {
+              if (!data) {
+                return;
+              }
+              const fmt = (value) => new Intl.NumberFormat().format(String(value).replace(/\D/g, ''));
+              document.getElementById('stat-views').textContent = fmt(data.count);
+              document.getElementById('stat-visitors').textContent = fmt(data.count_unique);
+              box.style.display = '';
+            })
+            .catch(() => {
+              /* leave the block hidden: never print an unverified number */
+            });
+        })();
+      </script>
+    {%- endif -%}
+  </p>
+
+  <p>
+    {%- capture _platform -%}
+      <a href="https://jekyllrb.com" target="_blank" rel="noopener">Jekyll</a>
+    {%- endcapture -%}
+
+    {%- capture _theme -%}
+      <a
+        data-bs-toggle="tooltip"
+        data-bs-placement="top"
+        title="v{{ theme.version }}"
+        href="https://github.com/cotes2020/jekyll-theme-chirpy"
+        target="_blank"
+        rel="noopener"
+      >Chirpy</a>
+    {%- endcapture -%}
+
+    {{ site.data.locales[include.lang].meta | replace: ':PLATFORM', _platform | replace: ':THEME', _theme }}
+  </p>
+</footer>
