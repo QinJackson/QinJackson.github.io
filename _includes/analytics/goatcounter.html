@@ -1,0 +1,16 @@
+{%- comment -%}
+  Site-level override of the theme's _includes/analytics/goatcounter.html
+  (Jekyll: the site's _includes take precedence over the theme's)
+
+  Only change vs. the theme: the counting script is self-hosted from
+  assets/goatcounter/count.js, so page loading does not depend on gc.zgo.at.
+  The beacon still reports to <env_id>.goatcounter.com (that is where the
+  data lives). Rendered only when comments/analytics are configured:
+  head.html gates this include on site.analytics.goatcounter.id.
+{%- endcomment -%}
+<!-- GoatCounter -->
+<script
+  async
+  src="{{ '/assets/goatcounter/count.js' | relative_url }}"
+  data-goatcounter="https://{{ site.analytics.goatcounter.id }}.goatcounter.com/count"
+></script>
