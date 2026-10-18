@@ -5,6 +5,7 @@
 
 - type: email
   icon: "fas fa-envelope"
+  noblank: true # 关键：mailto 必须在本页触发，否则会新开标签页停在 about:blank，系统不会弹应用选择
 
 - type: qq
   icon: "fab fa-qq"
