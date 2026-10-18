@@ -96,9 +96,20 @@ description: 一句话摘要（可选，显示在列表里）
 
 ### 5. 手机端怎么发
 
-**方式一（后台）**：手机打开 `https://qinjackson.github.io/admin/` → 选「日记」→ 新建 → 填标题/日期/标签/正文 → 发布（会自动 commit 到仓库，约 1 分钟上线）。
+**方式一（Pages CMS 后台，推荐）**
 
-**方式二（GitHub 网页）**：手机打开仓库 → `_diary/` → Add file → Create new file → 文件名 `2026-10-07-slug.md` → 粘贴上面的 front matter 模板 → 写正文 → Commit changes。
+1. 手机浏览器打开 **https://app.pagescms.org**
+2. 用 **GitHub 账号登录**；第一次会让你授权一个 GitHub App（只给这一个仓库的读写权限）
+3. 选中仓库 `QinJackson/QinJackson.github.io`
+4. 左侧点 **日记** → 右上角 **新建**
+5. 填标题、日期时间、标签（第一个必须选「日记」）、摘要（可选）、正文
+6. 点保存 → 它会自动 commit 到仓库 → 约 1 分钟站点自动更新
+
+字段表单已配好，不用手写 front matter；文件名也会按 `年-月-日-标题.md` 自动生成。
+
+**方式二（GitHub 网页，后台临时不可用时）**
+
+手机打开仓库 → `_diary/` → Add file → Create new file → 文件名 `2026-10-07-slug.md` → 粘贴第 2 节的 front matter 模板 → 写正文 → Commit changes。
 
 ### 6. 图片体积提醒
 
