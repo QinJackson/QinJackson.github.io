@@ -110,10 +110,11 @@
           {%- endunless -%}
           {%- comment -%}
             站点级覆盖：点击直接把邮箱复制到剪贴板。
-            这里刻意不用 mailto: —— mailto 会让手机弹出「选择应用打开」，
-            在没装邮件客户端的设备上还会毫无反应。地址只放在 data 属性里。
+            刻意不用 mailto:（手机弹「选择应用打开」，没邮件客户端时无反应），
+            也不用 #hash（htmlproofer 会当成页内锚点报错）。
+            javascript:void(0) 不产生任何导航，地址只放在 data 属性里。
           {%- endcomment -%}
-          {%- assign url = '#email-copy' -%}
+          {%- assign url = 'javascript:void(0)' -%}
         {% when 'rss' %}
           {% assign url = '/feed.xml' | relative_url %}
         {% else %}
