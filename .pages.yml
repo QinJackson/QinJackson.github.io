@@ -1,0 +1,62 @@
+# Pages CMS 配置（https://pagescms.org）
+# 使用方法：手机/电脑打开 https://app.pagescms.org → GitHub 登录 → 授权本仓库 → 就能在网页里写日记。
+# 这个文件只描述「网站里有什么内容、字段怎么填」，不涉及任何密钥。
+
+media:
+  input: assets/img/diary
+  output: /assets/img/diary
+  extensions: [png, jpg, jpeg, webp, gif]
+  rename: safe
+
+content:
+  # ==================== 日记 ====================
+  - name: diary
+    label: 日记
+    type: collection
+    path: _diary
+    format: yaml-frontmatter
+    filename:
+      template: '{year}-{month}-{day}-{primary}.md'
+      field: title
+    view:
+      primary: title
+      sort: date
+      order: desc
+      fields: [date, title, tags]
+    fields:
+      - name: title
+        label: 标题
+        type: string
+        required: true
+
+      - name: date
+        label: 日期时间
+        type: date
+        required: true
+        options:
+          format: 'yyyy-MM-dd HH:mm:ss'
+
+      - name: tags
+        label: 标签（第一个必须是「日记」）
+        type: select
+        required: true
+        multiple:
+          min: 1
+          max: 4
+          creatable: true
+        options:
+          values:
+            - 日记
+            - 学习
+            - 生活
+            - 高等数学
+            - C语言
+            - OpenWrt
+
+      - name: description
+        label: 摘要（可选，显示在日记列表）
+        type: text
+
+      - name: body
+        label: 正文
+        type: rich-text
