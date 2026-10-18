@@ -194,6 +194,10 @@ collections:
   tabs:
     output: true
     sort_by: order
+  # 日记：与 _posts 完全隔离，首页（site.posts）天然不会包含它
+  diary:
+    output: true
+    permalink: /diary/:name/
 
 defaults:
   - scope:
@@ -210,6 +214,16 @@ defaults:
       path: _drafts
     values:
       comments: false
+  # 日记的默认值（Collection 独立于 posts，首页不会包含）
+  # layout 用 post：这样 page.layout=='post' 的一系列门控（dayjs 相对时间、
+  # 阅读量、图片灯箱、目录、评论）全部照常生效，不需要改主题。
+  - scope:
+      path: ""
+      type: diary
+    values:
+      layout: post
+      comments: true
+      toc: true
   - scope:
       path: ""
       type: tabs # see `site.collections`

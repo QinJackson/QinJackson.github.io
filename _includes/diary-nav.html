@@ -1,0 +1,34 @@
+<!-- 日记之间的上一篇/下一篇：只在 site.diary 内部导航，不会串到长文 -->
+{% assign docs = site.diary | sort: 'date' %}
+{% assign cur = nil %}
+{% assign idx = nil %}
+{% for d in docs %}
+  {% if d.url == page.url %}
+    {% assign cur = d %}
+    {% assign idx = forloop.index0 %}
+  {% endif %}
+{% endfor %}
+
+{% if idx != nil %}
+  {% assign prev_i = idx | minus: 1 %}
+  {% assign next_i = idx | plus: 1 %}
+  <nav class="post-navigation d-flex justify-content-between" aria-label="Diary Navigation">
+    {% if prev_i >= 0 %}
+      {% assign p = docs[prev_i] %}
+      <a href="{{ p.url | relative_url }}" class="btn btn-outline-primary" aria-label="上一篇日记">
+        <p>{{ p.title }}</p>
+      </a>
+    {% else %}
+      <div class="btn btn-outline-primary disabled" aria-label="上一篇日记"><p>-</p></div>
+    {% endif %}
+
+    {% if next_i < docs.size %}
+      {% assign n = docs[next_i] %}
+      <a href="{{ n.url | relative_url }}" class="btn btn-outline-primary" aria-label="下一篇日记">
+        <p>{{ n.title }}</p>
+      </a>
+    {% else %}
+      <div class="btn btn-outline-primary disabled" aria-label="下一篇日记"><p>-</p></div>
+    {% endif %}
+  </nav>
+{% endif %}

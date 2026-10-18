@@ -1,0 +1,44 @@
+<!--
+  站点级覆盖：_includes/post-nav.html
+  与原主题唯一区别：日记（collection: diary）用 site.diary 内部的上/下篇，
+  因为 Jekyll 只给 posts 填充 page.previous / page.next，
+  collection 文档上它们是 nil（否则会渲染出两个灰掉的「-」按钮）。
+-->
+{% assign col = page.collection %}
+
+{% if col == 'diary' %}
+  {% include diary-nav.html %}
+{% else %}
+  <nav class="post-navigation d-flex justify-content-between" aria-label="Post Navigation">
+    {% assign previous = site.data.locales[include.lang].post.button.previous %}
+    {% assign next = site.data.locales[include.lang].post.button.next %}
+
+    {% if page.previous.url %}
+      <a
+        href="{{ site.baseurl }}{{ page.previous.url }}"
+        class="btn btn-outline-primary"
+        aria-label="{{ previous }}"
+      >
+        <p>{{ page.previous.title }}</p>
+      </a>
+    {% else %}
+      <div class="btn btn-outline-primary disabled" aria-label="{{ previous }}">
+        <p>-</p>
+      </div>
+    {% endif %}
+
+    {% if page.next.url %}
+      <a
+        href="{{ site.baseurl }}{{page.next.url}}"
+        class="btn btn-outline-primary"
+        aria-label="{{ next }}"
+      >
+        <p>{{ page.next.title }}</p>
+      </a>
+    {% else %}
+      <div class="btn btn-outline-primary disabled" aria-label="{{ next }}">
+        <p>-</p>
+      </div>
+    {% endif %}
+  </nav>
+{% endif %}
