@@ -5,11 +5,10 @@
 
 - type: email
   icon: "fas fa-envelope"
-  noblank: true # open link in current tab
 
 - type: qq
   icon: "fab fa-qq"
-  url: https://mp.qzone.qq.com/u/?uin=3059126996
+  url: https://user.qzone.qq.com/3059126996
 # Uncomment and complete the url below to enable more contact options
 #
 # - type: mastodon
