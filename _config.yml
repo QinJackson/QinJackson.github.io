@@ -197,7 +197,6 @@ collections:
   # 日记：与 _posts 完全隔离，首页（site.posts）天然不会包含它
   diary:
     output: true
-    permalink: /diary/:name/
 
 defaults:
   - scope:
@@ -217,6 +216,7 @@ defaults:
   # 日记的默认值（Collection 独立于 posts，首页不会包含）
   # layout 用 post：这样 page.layout=='post' 的一系列门控（dayjs 相对时间、
   # 阅读量、图片灯箱、目录、评论）全部照常生效，不需要改主题。
+  # permalink 必须写在 defaults 里（Jekyll 4 的 collection 级 permalink 不生效）。
   - scope:
       path: ""
       type: diary
@@ -224,6 +224,7 @@ defaults:
       layout: post
       comments: true
       toc: true
+      permalink: /diary/:name/
   - scope:
       path: ""
       type: tabs # see `site.collections`
