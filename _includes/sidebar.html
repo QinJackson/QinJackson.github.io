@@ -109,10 +109,10 @@
             {%- continue -%}
           {%- endunless -%}
           {%- comment -%}
-            站点级覆盖：默认是 mailto:（依赖系统邮件客户端，很多机器点了没反应）。
-            这里改成跳 QQ 邮箱网页版。
+            站点级覆盖：点击直接把邮箱复制到剪贴板（不跳转、不依赖系统邮件客户端）。
+            href 仍保留 mailto: 作为 JS 不可用时的兜底。
           {%- endcomment -%}
-          {%- assign url = 'https://mail.qq.com' -%}
+          {%- capture url -%}mailto:{{ site.social.email }}{%- endcapture -%}
         {% when 'rss' %}
           {% assign url = '/feed.xml' | relative_url %}
         {% else %}
@@ -123,12 +123,20 @@
         <a
           href="{{ url }}"
           aria-label="{{ entry.type }}"
+          {% if entry.type == 'email' %}
+            data-copy-email="{{ site.social.email }}"
+            title="{{ site.social.email }}（点击复制）"
+          {% endif %}
           {% assign link_types = '' %}
 
-          {% unless entry.noblank %}
+          {% if entry.type == 'email' %}
+            {%- comment -%} 邮箱图标是复制行为，不需要新标签页 {%- endcomment -%}
+          {% elsif entry.noblank %}
+            {%- comment -%} noblank: 当前标签页打开 {%- endcomment -%}
+          {% else %}
             target="_blank"
             {% assign link_types = 'noopener noreferrer' %}
-          {% endunless %}
+          {% endif %}
 
           {% if entry.type == 'mastodon' %}
             {% assign link_types = link_types | append: ' me' | strip %}
@@ -146,3 +154,43 @@
   <!-- .sidebar-bottom -->
 </aside>
 <!-- #sidebar -->
+
+<script>
+  // 邮箱图标：点击复制地址，不跳转
+  document.addEventListener('DOMContentLoaded', function () {
+    document.querySelectorAll('[data-copy-email]').forEach(function (el) {
+      el.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        var email = el.getAttribute('data-copy-email');
+
+        function done() {
+          var tip = document.createElement('span');
+          tip.textContent = '已复制 ' + email;
+          tip.style.cssText =
+            'position:fixed;left:50%;bottom:2rem;transform:translateX(-50%);' +
+            'background:rgba(0,0,0,.85);color:#fff;padding:.5rem .9rem;border-radius:.4rem;' +
+            'font-size:.85rem;z-index:9999;pointer-events:none;transition:opacity .3s';
+          document.body.appendChild(tip);
+          setTimeout(function () { tip.style.opacity = '0'; }, 1600);
+          setTimeout(function () { tip.remove(); }, 2000);
+        }
+
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(email).then(done).catch(fallback);
+        } else {
+          fallback();
+        }
+
+        function fallback() {
+          var ta = document.createElement('textarea');
+          ta.value = email;
+          ta.style.cssText = 'position:fixed;left:-9999px';
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand('copy'); done(); } catch (e) { window.prompt('复制这个邮箱地址：', email); }
+          ta.remove();
+        }
+      });
+    });
+  });
+</script>
