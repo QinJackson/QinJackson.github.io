@@ -109,10 +109,11 @@
             {%- continue -%}
           {%- endunless -%}
           {%- comment -%}
-            站点级覆盖：点击直接把邮箱复制到剪贴板（不跳转、不依赖系统邮件客户端）。
-            href 仍保留 mailto: 作为 JS 不可用时的兜底。
+            站点级覆盖：点击直接把邮箱复制到剪贴板。
+            这里刻意不用 mailto: —— mailto 会让手机弹出「选择应用打开」，
+            在没装邮件客户端的设备上还会毫无反应。地址只放在 data 属性里。
           {%- endcomment -%}
-          {%- capture url -%}mailto:{{ site.social.email }}{%- endcapture -%}
+          {%- assign url = '#email-copy' -%}
         {% when 'rss' %}
           {% assign url = '/feed.xml' | relative_url %}
         {% else %}
@@ -126,6 +127,7 @@
           {% if entry.type == 'email' %}
             data-copy-email="{{ site.social.email }}"
             title="{{ site.social.email }}（点击复制）"
+            onclick="return window.__dshCopyEmail && window.__dshCopyEmail(this.getAttribute('data-copy-email'), this)"
           {% endif %}
           {% assign link_types = '' %}
 
@@ -157,7 +159,10 @@
 
 <script>
   // 邮箱图标：点击复制地址，不跳转。
-  // 用事件委托挂在 document 上 —— 不依赖 DOMContentLoaded，也不受脚本执行顺序影响。
+  // 三重保险：
+  //   1) 元素上的内联 onclick 调 window.__dshCopyEmail（执行最早，不依赖脚本加载时序）
+  //   2) document 捕获阶段的事件委托（兜底）
+  //   3) href 不含 mailto:，最坏情况也不会弹「选择应用打开」
   (function () {
     if (window.__dshCopyEmailBound) return;
     window.__dshCopyEmailBound = true;
@@ -188,8 +193,11 @@
       return ok;
     }
 
-    function copyEmail(email) {
-      if (navigator.clipboard && window.isSecureContext) {
+    // 供内联 onclick 调用；返回 false 阻止默认跳转
+    window.__dshCopyEmail = function (email) {
+      if (!email) return false;
+
+      if (navigator.clipboard && window.isSecureContext && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(email).then(function () {
           showTip(email);
         }).catch(function () {
@@ -198,14 +206,16 @@
       } else {
         if (legacyCopy(email)) { showTip(email); } else { window.prompt('复制邮箱地址：', email); }
       }
-    }
+      return false;
+    };
 
+    // 兜底：捕获阶段委托（即使内联 onclick 因 CSP 等原因未执行也能工作）
     document.addEventListener('click', function (ev) {
       var el = ev.target && ev.target.closest ? ev.target.closest('[data-copy-email]') : null;
       if (!el) return;
       ev.preventDefault();
       ev.stopPropagation();
-      copyEmail(el.getAttribute('data-copy-email'));
+      window.__dshCopyEmail(el.getAttribute('data-copy-email'));
     }, true);
   })();
 </script>
