@@ -10,8 +10,7 @@ title: 日记
 
 <div id="diary-list" class="pl-xl-2">
   <p class="text-muted">
-    这里是我的日记与随记：一天一篇，记录学习、生活与当天想明白的事。
-    共 <strong>{{ docs | size }}</strong> 篇。
+    这里是我的日记与随记：记录学习、生活与当天想明白的事。
   </p>
 
   {% if docs.size == 0 %}
